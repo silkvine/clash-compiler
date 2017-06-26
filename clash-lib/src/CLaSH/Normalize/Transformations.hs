@@ -8,6 +8,7 @@
 
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell   #-}
+{-# LANGUAGE TupleSections     #-}
 {-# LANGUAGE ViewPatterns      #-}
 
 module CLaSH.Normalize.Transformations
@@ -51,9 +52,9 @@ import qualified Data.Maybe                  as Maybe
 import qualified Data.Set                    as Set
 import qualified Data.Set.Lens               as Lens
 import           Data.Text                   (Text, unpack)
-import           Unbound.Generics.LocallyNameless (Bind, Embed (..), bind, embed,
-                                              rec, unbind, unembed, unrebind,
-                                              unrec, name2String)
+import           Unbound.Generics.LocallyNameless
+  (Bind, Embed (..), bind, embed, rebind, rec, unbind, unembed, unrebind, unrec,
+   name2String)
 import           Unbound.Generics.LocallyNameless.Unsafe (unsafeUnbind)
 
 import           CLaSH.Core.DataCon          (DataCon (..))
@@ -61,13 +62,12 @@ import           CLaSH.Core.FreeVars         (termFreeIds, termFreeTyVars,
                                               typeFreeVars)
 import           CLaSH.Core.Literal          (Literal (..))
 import           CLaSH.Core.Pretty           (showDoc)
-import           CLaSH.Core.Subst            (substTm, substTms, substTyInTm,
-                                              substTysinTm)
+import           CLaSH.Core.Subst
+  (substTm, substTms, substTyInTm, substTys, substTysinTm)
 import           CLaSH.Core.Term             (LetBinding, Pat (..), Term (..))
-import           CLaSH.Core.Type             (TypeView (..), applyFunTy,
-                                              applyTy, isPolyFunCoreTy,
-                                              splitFunTy, typeKind,
-                                              tyView, undefinedTy)
+import           CLaSH.Core.Type
+  (LitTy (..), Type (..), TypeView (..), applyFunTy, applyTy, coreView,
+   isPolyFunCoreTy, splitFunTy, typeKind, tyView, undefinedTy)
 import           CLaSH.Core.TyCon            (tyConDataCons)
 import           CLaSH.Core.Util             (collectArgs, idToVar, isCon,
                                               isFun, isLet, isPolyFun, isPrim,
@@ -278,6 +278,71 @@ caseCon ctx e@(Case subj ty alts)
         _ -> traceIf (lvl > DebugNone)
                      ("Irreducible constant as case subject: " ++ showDoc subj ++ "\nCan be reduced to: " ++ showDoc subj')
                      (caseOneAlt e)
+  | any (isVecCon . fst . unsafeUnbind) alts
+  = do
+    tcm    <- Lens.view tcCache
+    subjTy <- termType tcm subj
+    alts'  <- mapM unbind alts
+    case vecN tcm subjTy of
+      Just (_,n,_)
+        | n == 0    -> case List.find (isNilCon . fst) alts' of
+          Just (DataPat tc pxs,e')
+            | let ftvs     = Lens.toListOf termFreeTyVars e'
+            , let (tvs,xs) = unrebind pxs
+            , let tvs'     = map varName tvs
+            , any (`elem` ftvs) tvs'
+            -> let substTyMap = zip tvs' (repeat (LitTy (NumTy 0)))
+                   xs'        = Maybe.mapMaybe (substTysinId substTyMap) xs
+                   bnds       = map (patToBnd (DataPat tc (rebind tvs xs'))) xs'
+                   e2         = substTysinTm substTyMap e'
+               in  changed (Letrec (bind (rec bnds) e2))
+            | otherwise -> return e
+          _ -> case alts' of
+            ((DefaultPat,e'):_) -> changed e'
+            _ -> changed (mkApps (Prim "CLaSH.Transformations.undefined" undefinedTy) [Right ty])
+        | otherwise -> case List.find (isConsCon . fst) alts' of
+          Just (DataPat tc pxs,e')
+            | let ftvs     = Lens.toListOf termFreeTyVars e'
+            , let (tvs,xs) = unrebind pxs
+            , let tvs'     = map varName tvs
+            , any (`elem` ftvs) tvs'
+            -> let substTyMap = zip tvs' (repeat (LitTy (NumTy (n-1))))
+                   xs'        = Maybe.mapMaybe (substTysinId substTyMap) xs
+                   bnds       = map (patToBnd (DataPat tc (rebind tvs xs'))) xs'
+                   e2         = substTysinTm substTyMap e'
+               in  changed (Letrec (bind (rec bnds) e2))
+            | otherwise -> return e
+          _ -> case alts' of
+            ((DefaultPat,e'):_) -> changed e'
+            _ -> changed (mkApps (Prim "CLaSH.Transformations.undefined" undefinedTy) [Right ty])
+      _ -> caseOneAlt e
+  where
+    isConsCon (DataPat dc' _) =
+      name2String (dcName (unembed dc')) == "CLaSH.Sized.Vector.Cons"
+    isConsCon _ = False
+
+    isNilCon (DataPat dc' _) =
+      name2String (dcName (unembed dc')) == "CLaSH.Sized.Vector.Nil"
+    isNilCon _ = False
+
+    isVecCon pat = isNilCon pat || isConsCon pat
+
+    vecN tcm (coreView tcm -> Just ty') = vecN tcm ty'
+    vecN tcm (tyView -> TyConApp vecTc [nty,aty]) =
+      (vecTc,,aty) <$> litN tcm nty
+    vecN _ _ = Nothing
+
+    litN tcm (coreView tcm -> Just ty') = litN tcm ty'
+    litN _   (LitTy (NumTy i))         = Just i
+    litN _ _ = Nothing
+
+    substTysinId substTyMap (Id nm tyE) =
+      Just (Id nm (embed (substTys substTyMap (unembed tyE))))
+    substTysinId _ _ = Nothing
+
+    patToBnd :: Pat -> Id -> (Id,Embed Term)
+    patToBnd pat i = (i,embed (Case subj ty [bind pat (Var (unembed (varType i)) (varName i))]))
+
 
 caseCon _ e = caseOneAlt e
 
