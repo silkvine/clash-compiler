@@ -1,7 +1,8 @@
-dist*
-.stack-work
+dist/
+dist-newstyle/
+.stack-work/
 cabal-dev
-cabal.project.local
+/cabal.project.local
 .ghc.environment.*
 *.o
 *.o-boot
@@ -26,6 +27,19 @@ cabal.config
 *.prof
 *.aux
 *.hp
+*.bin
 
 *~
 *.DS_Store
+
+# IntelliJ
+/.idea
+*.iml
+
+# HDL directories often created during development cycle
+/vhdl
+/verilog
+/systemverilog
+
+# Temporary directory for Clash testsuite
+/.clash-test-tmp

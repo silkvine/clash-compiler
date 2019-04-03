@@ -8,8 +8,10 @@
   Type and instance definitions for Primitive
 -}
 
+{-# LANGUAGE DeriveAnyClass    #-}
 {-# LANGUAGE DeriveFunctor     #-}
 {-# LANGUAGE DeriveFoldable    #-}
+{-# LANGUAGE DeriveGeneric     #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase        #-}
@@ -22,6 +24,8 @@ module Clash.Primitives.Types
   , TemplateFormat(..)
   , BlackBoxFunctionName(..)
   , Primitive(..)
+  , GuardedCompiledPrimitive
+  , GuardedResolvedPrimitive
   , PrimMap
   , UnresolvedPrimitive
   , ResolvedPrimitive
@@ -31,41 +35,48 @@ module Clash.Primitives.Types
   ) where
 
 import {-# SOURCE #-} Clash.Netlist.Types
+import           Clash.Annotations.Primitive  (PrimitiveGuard)
 import           Clash.Netlist.BlackBox.Types
-  (BlackBoxTemplate, BlackBoxFunction, TemplateKind (..))
+  (BlackBoxFunction, BlackBoxTemplate, TemplateKind (..))
 import           Control.Applicative          ((<|>))
+import           Control.DeepSeq              (NFData)
 import           Data.Aeson
   (FromJSON (..), Value (..), (.:), (.:?), (.!=))
+import           Data.Binary                  (Binary)
 import           Data.Char                    (isUpper, isLower, isAlphaNum)
 import           Data.Either                  (lefts)
-import           Data.HashMap.Lazy            (HashMap)
+import           Data.Hashable                (Hashable)
 import qualified Data.HashMap.Strict          as H
 import           Data.List                    (intercalate)
 import qualified Data.Text                    as S
 import           Data.Text.Lazy               (Text)
+import           GHC.Generics                 (Generic)
 import           GHC.Stack                    (HasCallStack)
 
 -- | An unresolved primitive still contains pointers to files.
-type UnresolvedPrimitive = Primitive Text ((TemplateFormat,BlackBoxFunctionName),Maybe TemplateSource) (Maybe TemplateSource)
+type UnresolvedPrimitive = Primitive Text ((TemplateFormat,BlackBoxFunctionName),Maybe TemplateSource) (Maybe S.Text) (Maybe TemplateSource)
 
 -- | A parsed primitive does not contain pointers to filesystem files anymore,
 -- but holds uncompiled @BlackBoxTemplate@s and @BlackBoxFunction@s.
-type ResolvedPrimitive = Primitive Text ((TemplateFormat,BlackBoxFunctionName),Maybe Text) (Maybe Text)
-type ResolvedPrimMap   = PrimMap ResolvedPrimitive
+type ResolvedPrimitive        = Primitive Text ((TemplateFormat,BlackBoxFunctionName),Maybe Text) () (Maybe Text)
+type GuardedResolvedPrimitive = PrimitiveGuard ResolvedPrimitive
+type ResolvedPrimMap          = PrimMap GuardedResolvedPrimitive
 
 -- | A compiled primitive has compiled all templates and functions from its
--- @ResolvedPrimitive@ counterpart.
-type CompiledPrimitive = Primitive BlackBoxTemplate BlackBox BlackBoxFunction
-type CompiledPrimMap   = PrimMap CompiledPrimitive
+-- @ResolvedPrimitive@ counterpart. The Int in the tuple is a hash of the
+-- (uncompiled) BlackBoxFunction.
+type CompiledPrimitive        = Primitive BlackBoxTemplate BlackBox () (Int, BlackBoxFunction)
+type GuardedCompiledPrimitive = PrimitiveGuard CompiledPrimitive
+type CompiledPrimMap          = PrimMap GuardedCompiledPrimitive
 
 -- | A @PrimMap@ maps primitive names to a @Primitive@
-type PrimMap a = HashMap S.Text a
+type PrimMap a = H.HashMap S.Text a
 
 -- | A BBFN is a parsed version of a fully qualified function name. It is
 -- guaranteed to have at least one module name which is not /Main/.
 data BlackBoxFunctionName =
   BlackBoxFunctionName [String] String
-    deriving (Eq)
+    deriving (Eq, Generic, NFData, Binary, Hashable)
 
 instance Show BlackBoxFunctionName where
   show (BlackBoxFunctionName mods funcName) =
@@ -119,16 +130,20 @@ data TemplateSource
 data TemplateFormat
   = TTemplate
   | THaskell
-  deriving Show
+  deriving (Show, Generic, Hashable, NFData)
 
 -- | Externally defined primitive
-data Primitive a b c
+data Primitive a b c d
   -- | Primitive template written in a Clash specific templating language
   = BlackBox
   { name      :: !S.Text
     -- ^ Name of the primitive
   , kind      :: TemplateKind
     -- ^ Whether this results in an expression or a declaration
+  , warning  :: c
+    -- ^ A warning to be outputted when the primitive is instantiated.
+    -- This is intended to be used as a warning for primitives that are not
+    -- synthesizable, but may also be used for other purposes.
   , outputReg :: Bool
     -- ^ Verilog only: whether the result should be a /reg/(@True@) or /wire/
     -- (@False@); when not specified in the /.json/ file, the value will default
@@ -150,17 +165,19 @@ data Primitive a b c
   { name :: !S.Text
     -- ^ Name of the primitive
   , functionName :: BlackBoxFunctionName
-  , function :: c
-    -- ^ Used to indiciate type of template (declaration or expression).
+  , function :: d
+    -- ^ Used to indicate type of template (declaration or expression).
   }
-  -- | A primitive that carries additional information
+  -- | A primitive that carries additional information. These are "real"
+  -- primitives, hardcoded in the compiler. For example: 'mapSignal' in
+  -- @GHC2Core.coreToTerm@.
   | Primitive
   { name     :: !S.Text
     -- ^ Name of the primitive
   , primType :: !Text
     -- ^ Additional information
   }
-  deriving Show
+  deriving (Show, Generic, NFData, Binary, Hashable, Functor)
 
 instance FromJSON UnresolvedPrimitive where
   parseJSON (Object v) =
@@ -174,12 +191,13 @@ instance FromJSON UnresolvedPrimitive where
                  <|> (Just . TFile   <$> conVal .: "file")
                  <|> (pure Nothing)
 
-            let fName' = either error id (parseBBFN fName)
+            fName' <- either fail return (parseBBFN fName)
 
             return (BlackBoxHaskell name' fName' templ)
           "BlackBox"  ->
             BlackBox <$> conVal .: "name"
                      <*> (conVal .: "kind" >>= parseTemplateKind)
+                     <*> conVal .:? "warning"
                      <*> conVal .:? "outputReg" .!= False
                      <*> conVal .:? "libraries" .!= []
                      <*> conVal .:? "imports" .!= []
@@ -189,8 +207,8 @@ instance FromJSON UnresolvedPrimitive where
             Primitive <$> conVal .: "name"
                       <*> conVal .: "primType"
 
-          e -> error $ "[1] Expected: BlackBox or Primitive object, got: " ++ show e
-      e -> error $ "[2] Expected: BlackBox or Primitive object, got: " ++ show e
+          e -> fail $ "[1] Expected: BlackBox or Primitive object, got: " ++ show e
+      e -> fail $ "[2] Expected: BlackBox or Primitive object, got: " ++ show e
     where
       parseTemplate c =
         (,) <$> ((,) <$> (c .:? "format" >>= traverse parseTemplateFormat) .!= TTemplate
@@ -205,15 +223,15 @@ instance FromJSON UnresolvedPrimitive where
 
       parseTemplateKind (String "Declaration") = pure TDecl
       parseTemplateKind (String "Expression")  = pure TExpr
-      parseTemplateKind c = error ("[4] Expected: Declaration or Expression, got " ++ show c)
+      parseTemplateKind c = fail ("[4] Expected: Declaration or Expression, got " ++ show c)
 
       parseTemplateFormat (String "Template") = pure TTemplate
       parseTemplateFormat (String "Haskell")  = pure THaskell
-      parseTemplateFormat c = error ("[5] unexpected format: " ++ show c)
+      parseTemplateFormat c = fail ("[5] unexpected format: " ++ show c)
 
-      parseBBFN' = either error return . parseBBFN
+      parseBBFN' = either fail return . parseBBFN
 
       defTemplateFunction = BlackBoxFunctionName ["Template"] "template"
 
   parseJSON unexpected =
-    error $ "[3] Expected: BlackBox or Primitive object, got: " ++ show unexpected
+    fail $ "[3] Expected: BlackBox or Primitive object, got: " ++ show unexpected

@@ -10,39 +10,43 @@
 
 {-# LANGUAGE CPP #-}
 
-module Clash.Driver.Types
-  (module Clash.Driver.Types
-  ,SrcSpan, noSrcSpan
-  )
-where
+module Clash.Driver.Types where
 
 -- For Int/Word size
 #include "MachDeps.h"
 
-import Control.Exception (Exception)
-import Data.HashMap.Lazy (HashMap)
-import Data.Text.Lazy    (Text)
+import Data.Text         (Text)
 
 import BasicTypes        (InlineSpec)
-import SrcLoc            (SrcSpan, noSrcSpan)
+import SrcLoc            (SrcSpan)
 
-import Clash.Core.Term   (Term,TmName,TmOccName)
-import Clash.Core.Type   (Type)
+import Clash.Core.Term   (Term)
+import Clash.Core.Var    (Id)
+import Clash.Core.VarEnv (VarEnv)
 
 import Clash.Netlist.BlackBox.Types (HdlSyn (..))
+
+import Util (OverridingBool(..))
 
 -- | Global function binders
 --
 -- Global functions cannot be mutually recursive, only self-recursive
-type BindingMap = HashMap TmOccName (TmName,Type,SrcSpan,InlineSpec,Term)
+type BindingMap = VarEnv (Id,SrcSpan,InlineSpec,Term)
 
 -- | Debug Message Verbosity
 data DebugLevel
-  = DebugNone    -- ^ Don't show debug messages
-  | DebugFinal   -- ^ Show completely normalized expressions
-  | DebugName    -- ^ Names of applied transformations
-  | DebugApplied -- ^ Show sub-expressions after a successful rewrite
-  | DebugAll     -- ^ Show all sub-expressions on which a rewrite is attempted
+  = DebugNone
+  -- ^ Don't show debug messages
+  | DebugSilent
+  -- ^ Run invariant checks and err if violated (enabled by any debug flag)
+  | DebugFinal
+  -- ^ Show completely normalized expressions
+  | DebugName
+  -- ^ Names of applied transformations
+  | DebugApplied
+  -- ^ Show sub-expressions after a successful rewrite
+  | DebugAll
+  -- ^ Show all sub-expressions on which a rewrite is attempted
   deriving (Eq,Ord,Read)
 
 data ClashOpts = ClashOpts { opt_inlineLimit :: Int
@@ -52,19 +56,28 @@ data ClashOpts = ClashOpts { opt_inlineLimit :: Int
                            , opt_dbgLevel    :: DebugLevel
                            , opt_cachehdl    :: Bool
                            , opt_cleanhdl    :: Bool
+                           , opt_primWarn    :: Bool
+                           , opt_color       :: OverridingBool
                            , opt_intWidth    :: Int
                            , opt_hdlDir      :: Maybe String
+                           , opt_tmpDir      :: String
+                           -- ^ Directory to store temporary files in. Will be
+                           -- cleaned after Clash has finished executing.
                            , opt_hdlSyn      :: HdlSyn
                            , opt_errorExtra  :: Bool
                            , opt_floatSupport :: Bool
                            , opt_importPaths :: [FilePath]
                            , opt_componentPrefix :: Maybe String
+                           , opt_newInlineStrat :: Bool
+                           , opt_escapedIds :: Bool
                            }
 
 
 defClashOpts
-  :: ClashOpts
-defClashOpts
+  :: FilePath
+  -- ^ Temporary directory
+  -> ClashOpts
+defClashOpts tmpDir
   = ClashOpts
   { opt_dbgLevel            = DebugNone
   , opt_inlineLimit         = 20
@@ -73,21 +86,19 @@ defClashOpts
   , opt_inlineConstantLimit = 0
   , opt_cachehdl            = True
   , opt_cleanhdl            = True
+  , opt_primWarn            = True
+  , opt_color               = Auto
   , opt_intWidth            = WORD_SIZE_IN_BITS
   , opt_hdlDir              = Nothing
+  , opt_tmpDir              = tmpDir
   , opt_hdlSyn              = Other
   , opt_errorExtra          = False
   , opt_floatSupport        = False
   , opt_importPaths         = []
   , opt_componentPrefix     = Nothing
+  , opt_newInlineStrat      = True
+  , opt_escapedIds          = True
   }
-
-data ClashException = ClashException SrcSpan String (Maybe String)
-
-instance Show ClashException where
-  show (ClashException _ s eM) = s ++ "\n" ++ maybe "" id eM
-
-instance Exception ClashException
 
 -- | Information about the generated HDL between (sub)runs of the compiler
 data Manifest

@@ -45,37 +45,34 @@ where
 import           Control.Concurrent.Supply        (splitSupply)
 import qualified Control.Lens                     as Lens
 import           Data.Bits                        ((.&.),complement)
+import           Data.Coerce                      (coerce)
 import qualified Data.Either                      as Either
 import qualified Data.Foldable                    as Foldable
-import qualified Data.HashMap.Strict              as HashMap
 import qualified Data.IntMap.Strict               as IM
+import qualified Data.IntSet                      as IntSet
 import qualified Data.List                        as List
 import qualified Data.Map.Strict                  as Map
 import qualified Data.Maybe                       as Maybe
-import           Data.Set                         (Set)
-import qualified Data.Set                         as Set
-import qualified Data.Set.Lens                    as Lens
-
-import           Unbound.Generics.LocallyNameless
-  (Bind, bind, embed, fv, unbind, unembed, unrec)
-import qualified Unbound.Generics.LocallyNameless as Unbound
+import           Data.Monoid                      (All (..))
 
 -- internal
 import Clash.Core.DataCon    (DataCon, dcTag)
 import Clash.Core.Evaluator  (whnf')
-import Clash.Core.FreeVars   (termFreeIds, typeFreeVars)
-import Clash.Core.Name       (Name (..), string2InternalName)
+import Clash.Core.FreeVars
+  (termFreeVars', typeFreeVars', varsDoNotOccurIn)
 import Clash.Core.Literal    (Literal (..))
-import Clash.Core.Term       (LetBinding, Pat (..), Term (..), TmOccName)
+import Clash.Core.Term       (LetBinding, Pat (..), Term (..))
 import Clash.Core.TyCon      (tyConDataCons)
 import Clash.Core.Type       (Type, isPolyFunTy, mkTyConApp, splitFunForallTy)
-import Clash.Core.Util       (collectArgs, mkApps, termType)
+import Clash.Core.Util       (collectArgs, mkApps, patIds, termType)
+import Clash.Core.VarEnv
+  (InScopeSet, elemInScopeSet, notElemInScopeSet)
 import Clash.Normalize.Types (NormalizeState)
-import Clash.Normalize.Util  (isConstant)
 import Clash.Rewrite.Types
   (RewriteMonad, bindings, evaluator, globalHeap, tcCache, tupleTcCache, uniqSupply)
 import Clash.Rewrite.Util    (mkInternalVar, mkSelectorCase,
-                              isUntranslatableType)
+                              isUntranslatableType, isConstant)
+import Clash.Unique          (lookupUniqMap)
 import Clash.Util
 
 data CaseTree a
@@ -118,23 +115,29 @@ allEqual (x:xs) = all (== x) xs
 -- | Collect 'CaseTree's for (potentially) disjoint applications of globals out
 -- of an expression. Also substitute truly disjoint applications of globals by a
 -- reference to a lifted out application.
-collectGlobals ::
-     Set TmOccName
-  -> [(Term,Term)] -- ^ Substitution of (applications of) a global
-                   -- binder by a reference to a lifted term.
-  -> [Term] -- ^ List of already seen global binders
-  -> Term -- ^ The expression
-  -> RewriteMonad NormalizeState
-                  (Term,[(Term,([Term],CaseTree [(Either Term Type)]))])
-collectGlobals inScope substitution seen (Case scrut ty alts) = do
+collectGlobals'
+  :: InScopeSet
+  -> [(Term,Term)]
+  -- ^ Substitution of (applications of) a global binder by a reference to a
+  -- lifted term.
+  -> [Term]
+  -- ^ List of already seen global binders
+  -> Term
+  -- ^ The expression
+  -> Bool
+  -- ^ Whether expression is constant
+  -> RewriteMonad
+      NormalizeState
+      (Term, [(Term, ([Term], CaseTree [Either Term Type]))])
+collectGlobals' inScope substitution seen (Case scrut ty alts) _eIsConstant = do
   rec (alts' ,collected)  <- collectGlobalsAlts inScope substitution seen scrut'
                                                 alts
       (scrut',collected') <- collectGlobals inScope substitution
                                             (map fst collected ++ seen) scrut
   return (Case scrut' ty alts',collected ++ collected')
 
-collectGlobals inScope substitution seen e@(collectArgs -> (fun, args@(_:_)))
-  | not (isConstant e) = do
+collectGlobals' inScope substitution seen e@(collectArgs -> (fun, args@(_:_))) eIsconstant
+  | not eIsconstant = do
     tcm <- Lens.view tcCache
     bndrs <- Lens.use bindings
     primEval <- Lens.view evaluator
@@ -142,48 +145,67 @@ collectGlobals inScope substitution seen e@(collectArgs -> (fun, args@(_:_)))
     ids <- Lens.use uniqSupply
     let (ids1,ids2) = splitSupply ids
     uniqSupply Lens..= ids2
-    let eval = snd . whnf' primEval bndrs tcm gh ids1 False
-    eTy <- termType tcm e
+    let eval = (Lens.view Lens._3) . whnf' primEval bndrs tcm gh ids1 inScope False
+        eTy  = termType tcm e
     untran <- isUntranslatableType False eTy
     case untran of
       -- Don't lift out non-representable values, because they cannot be let-bound
       -- in our desired normal form.
-      False -> case interestingToLift inScope eval fun args of
-        Just fun' | fun' `notElem` seen -> do
-          (args',collected) <- collectGlobalsArgs inScope substitution
-                                                  (fun':seen) args
-          let e' = Maybe.fromMaybe (mkApps fun' args') (List.lookup fun' substitution)
-          -- This function is lifted out an environment with the currently 'seen'
-          -- binders. When we later apply substitution, we need to start with this
-          -- environment, otherwise we perform incorrect substitutions in the
-          -- arguments.
-          return (e',(fun',(seen,Leaf args')):collected)
-        _ -> do (args',collected) <- collectGlobalsArgs inScope substitution
-                                                        seen args
-                return (mkApps fun args',collected)
+      False -> do
+        isInteresting <- interestingToLift inScope eval fun args
+        case isInteresting of
+          Just fun' | fun' `notElem` seen -> do
+            (args',collected) <- collectGlobalsArgs inScope substitution
+                                                    (fun':seen) args
+            let e' = Maybe.fromMaybe (mkApps fun' args') (List.lookup fun' substitution)
+            -- This function is lifted out an environment with the currently 'seen'
+            -- binders. When we later apply substitution, we need to start with this
+            -- environment, otherwise we perform incorrect substitutions in the
+            -- arguments.
+            return (e',(fun',(seen,Leaf args')):collected)
+          _ -> do (args',collected) <- collectGlobalsArgs inScope substitution
+                                                          seen args
+                  return (mkApps fun args',collected)
       _ -> return (e,[])
 
 -- FIXME: This duplicates A LOT of let-bindings, where I just pray that after
 -- the ANF, CSE, and DeadCodeRemoval pass all duplicates are removed.
 --
 -- I think we should be able to do better, but perhaps we cannot fix it here.
-collectGlobals inScope substitution seen (Letrec b) = do
-  (unrec -> lbs,body) <- unbind b
+collectGlobals' inScope substitution seen (Letrec lbs body) _eIsConstant = do
   (body',collected)   <- collectGlobals    inScope substitution seen body
   (lbs',collected')   <- collectGlobalsLbs inScope substitution
                                            (map fst collected ++ seen)
                                            lbs
-  return (Letrec (bind (Unbound.rec lbs') body')
+  return (Letrec lbs' body'
          ,map (second (second (LB lbs'))) (collected ++ collected')
          )
 
-collectGlobals _ _ _ e = return (e,[])
+collectGlobals' _ _ _ e _ = return (e,[])
+
+-- | Collect 'CaseTree's for (potentially) disjoint applications of globals out
+-- of an expression. Also substitute truly disjoint applications of globals by a
+-- reference to a lifted out application.
+collectGlobals
+  :: InScopeSet
+  -> [(Term,Term)]
+  -- ^ Substitution of (applications of) a global binder by a reference to
+  -- a lifted term.
+  -> [Term]
+  -- ^ List of already seen global binders
+  -> Term
+  -- ^ The expression
+  -> RewriteMonad
+      NormalizeState
+      (Term, [(Term, ([Term], CaseTree [Either Term Type]))])
+collectGlobals inScope substitution seen e =
+  collectGlobals' inScope substitution seen e =<< isConstant e
 
 -- | Collect 'CaseTree's for (potentially) disjoint applications of globals out
 -- of a list of application arguments. Also substitute truly disjoint
 -- applications of globals by a reference to a lifted out application.
 collectGlobalsArgs ::
-     Set TmOccName
+     InScopeSet
   -> [(Term,Term)] -- ^ Substitution of (applications of) a global
                    -- binder by a reference to a lifted term.
   -> [Term] -- ^ List of already seen global binders
@@ -205,14 +227,14 @@ collectGlobalsArgs inScope substitution seen args = do
 -- of a list of alternatives. Also substitute truly disjoint applications of
 -- globals by a reference to a lifted out application.
 collectGlobalsAlts ::
-     Set TmOccName
+     InScopeSet
   -> [(Term,Term)] -- ^ Substitution of (applications of) a global
                    -- binder by a reference to a lifted term.
   -> [Term] -- ^ List of already seen global binders
   -> Term -- ^ The subject term
-  -> [Bind Pat Term] -- ^ The list of alternatives
+  -> [(Pat,Term)] -- ^ The list of alternatives
   -> RewriteMonad NormalizeState
-                  ([Bind Pat Term]
+                  ([(Pat,Term)]
                   ,[(Term,([Term],CaseTree [(Either Term Type)]))]
                   )
 collectGlobalsAlts inScope substitution seen scrut alts = do
@@ -222,15 +244,15 @@ collectGlobalsAlts inScope substitution seen scrut alts = do
         collected'  = map (second (second (Branch scrut))) (Map.toList collectedUN)
     return (alts',collected')
   where
-    go pe = do (p,e) <- unbind pe
-               (e',collected) <- collectGlobals inScope substitution seen e
-               return (bind p e',map (second (second (p,))) collected)
+    go (p,e) = do
+      (e',collected) <- collectGlobals inScope substitution seen e
+      return ((p,e'),map (second (second (p,))) collected)
 
 -- | Collect 'CaseTree's for (potentially) disjoint applications of globals out
 -- of a list of let-bindings. Also substitute truly disjoint applications of
 -- globals by a reference to a lifted out application.
 collectGlobalsLbs ::
-     Set TmOccName
+     InScopeSet
   -> [(Term,Term)] -- ^ Substitution of (applications of) a global
                    -- binder by a reference to a lifted term.
   -> [Term] -- ^ List of already seen global binders
@@ -250,61 +272,68 @@ collectGlobalsLbs inScope substitution seen lbs = do
                    ,[(Term,([Term],CaseTree [(Either Term Type)]))]
                    )
                   )
-    go s (id_,unembed -> e) = do
+    go s (id_, e) = do
       (e',collected) <- collectGlobals inScope substitution s e
-      return (map fst collected ++ s,((id_,embed e'),collected))
+      return (map fst collected ++ s,((id_,e'),collected))
 
 -- | Given a case-tree corresponding to a disjoint interesting \"term-in-a-
 -- function-position\", return a let-expression: where the let-binding holds
--- a case-expression selecting between the uncommon arguments of the case-tree,
--- and the body is an application of the term applied to the common arguments of
--- the case tree, and projections of let-binding corresponding to the uncommon
+-- a case-expression selecting between the distinct arguments of the case-tree,
+-- and the body is an application of the term applied to the shared arguments of
+-- the case tree, and projections of let-binding corresponding to the distinct
 -- argument positions.
-mkDisjointGroup :: Set TmOccName -- ^ Current free variables.
-                -> (Term,([Term],CaseTree [(Either Term Type)]))
-                   -- ^ Case-tree of arguments belonging to the applied term.
-                -> RewriteMonad NormalizeState (Term,[Term])
-mkDisjointGroup fvs (fun,(seen,cs)) = do
+mkDisjointGroup
+  :: InScopeSet
+  -- ^ Variables in scope at the very top of the case-tree, i.e., the original
+  -- expression
+  -> (Term,([Term],CaseTree [(Either Term Type)]))
+  -- ^ Case-tree of arguments belonging to the applied term.
+  -> RewriteMonad NormalizeState (Term,[Term])
+mkDisjointGroup inScope (fun,(seen,cs)) = do
     let argss    = Foldable.toList cs
         argssT   = zip [0..] (List.transpose argss)
-        (commonT,uncommonT) = List.partition (isCommon fvs . snd) argssT
-        common   = map (second head) commonT
-        uncommon = map (Either.lefts) (List.transpose (map snd uncommonT))
+        (sharedT,distinctT) = List.partition (areShared inScope . snd) argssT
+        shared   = map (second head) sharedT
+        distinct = map (Either.lefts) (List.transpose (map snd distinctT))
         cs'      = fmap (zip [0..]) cs
         cs''     = removeEmpty
                  $ fmap (Either.lefts . map snd)
-                        (if null common
+                        (if null shared
                            then cs'
-                           else fmap (filter (`notElem` common)) cs')
+                           else fmap (filter (`notElem` shared)) cs')
     tcm <- Lens.view tcCache
-    (uncommonCaseM,uncommonProjections) <- case uncommon of
-      -- only common arguments: do nothing.
+    (distinctCaseM,distinctProjections) <- case distinct of
+      -- only shared arguments: do nothing.
       [] -> return (Nothing,[])
       -- Create selectors and projections
       (uc:_) -> do
-        argTys <- mapM (termType tcm) uc
-        disJointSelProj argTys cs''
-    let newArgs = mkDJArgs 0 common uncommonProjections
-    case uncommonCaseM of
-      Just lb -> return (Letrec (bind (Unbound.rec [lb]) (mkApps fun newArgs)), seen)
+        let argTys = map (termType tcm) uc
+        disJointSelProj inScope argTys cs''
+    let newArgs = mkDJArgs 0 shared distinctProjections
+    case distinctCaseM of
+      Just lb -> return (Letrec [lb] (mkApps fun newArgs), seen)
       Nothing -> return (mkApps fun newArgs, seen)
 
--- | Create a single selector for all the representable uncommon arguments by
+-- | Create a single selector for all the representable distinct arguments by
 -- selecting between tuples. This selector is only ('Just') created when the
 -- number of representable uncommmon arguments is larger than one, otherwise it
 -- is not ('Nothing').
 --
 -- It also returns:
 --
--- * For all the non-representable uncommon arguments: a selector
--- * For all the representable uncommon arguments: a projection out of the tuple
+-- * For all the non-representable distinct arguments: a selector
+-- * For all the representable distinct arguments: a projection out of the tuple
 --   created by the larger selector. If this larger selector does not exist, a
---   single selector is created for the single representable uncommon argument.
-disJointSelProj :: [Type] -- ^ Types of the arguments
-                -> CaseTree [Term] -- The case-tree of arguments
-                -> RewriteMonad NormalizeState (Maybe LetBinding,[Term])
-disJointSelProj _ (Leaf []) = return (Nothing,[])
-disJointSelProj argTys cs = do
+--   single selector is created for the single representable distinct argument.
+disJointSelProj
+  :: InScopeSet
+  -> [Type]
+  -- ^ Types of the arguments
+  -> CaseTree [Term]
+  -- The case-tree of arguments
+  -> RewriteMonad NormalizeState (Maybe LetBinding,[Term])
+disJointSelProj _ _ (Leaf []) = return (Nothing,[])
+disJointSelProj inScope argTys cs = do
     let maxIndex = length argTys - 1
         css = map (\i -> fmap ((:[]) . (!!i)) cs) [0..maxIndex]
     (untran,tran) <- partitionM (isUntranslatableType False . snd) (zip [0..] argTys)
@@ -319,16 +348,16 @@ disJointSelProj argTys cs = do
         tupTcm <- Lens.view tupleTcCache
         let m            = length tys
             Just tupTcNm = IM.lookup m tupTcm
-            Just tupTc   = HashMap.lookup (nameOcc tupTcNm) tcm
+            Just tupTc   = lookupUniqMap tupTcNm tcm
             [tupDc]      = tyConDataCons tupTc
             (tyIxs,tys') = unzip tys
             tupTy        = mkTyConApp tupTcNm tys'
             cs'          = fmap (\es -> map (es !!) tyIxs) cs
             djCase       = genCase tupTy (Just tupDc) tys' cs'
-        (scrutId,scrutVar) <- mkInternalVar (string2InternalName "tupIn") tupTy
+        scrutId <- mkInternalVar inScope "tupIn" tupTy
         projections <- mapM (mkSelectorCase ($(curLoc) ++ "disJointSelProj")
-                                            tcm scrutVar (dcTag tupDc)) [0..m-1]
-        return (Just (scrutId,embed djCase),projections)
+                                            inScope tcm (Var scrutId) (dcTag tupDc)) [0..m-1]
+        return (Just (scrutId,djCase),projections)
     let selProjs = tranOrUnTran 0 (zip (map fst untran) untranSels) projs
 
     return (lbM,selProjs)
@@ -339,19 +368,27 @@ disJointSelProj argTys cs = do
       | n == ut   = s : tranOrUnTran (n+1) uts          (p:projs)
       | otherwise = p : tranOrUnTran (n+1) ((ut,s):uts) projs
 
+-- | Arguments are shared between invocations if:
+--
+-- * They contain _no_ references to locally-bound variables
+-- * Are all equal
+areShared :: InScopeSet -> [Either Term Type] -> Bool
+areShared _       []       = True
+areShared inScope xs@(x:_) = noFV1 && allEqual xs
+ where
+  noFV1 = case x of
+    Right ty -> getAll (Lens.foldMapOf (typeFreeVars' isLocallyBound IntSet.empty)
+                                       (const (All False)) ty)
+    Left tm  -> getAll (Lens.foldMapOf (termFreeVars' isLocallyBound)
+                                       (const (All False)) tm)
 
-isCommon :: Set TmOccName -> [Either Term Type] -> Bool
-isCommon _   []             = True
-isCommon _   (Right ty:tys) = Set.null (Lens.setOf typeFreeVars ty) &&
-                              allEqual (Right ty:tys)
-isCommon fvs (Left tm:tms)  = Set.null (Lens.setOf termFreeIds tm Set.\\ fvs) &&
-                              allEqual (Left tm:tms)
+  isLocallyBound v = v `notElemInScopeSet` inScope
 
 -- | Create a list of arguments given a map of positions to common arguments,
 -- and a list of arguments
 mkDJArgs :: Int -- ^ Current position
          -> [(Int,Either Term Type)] -- ^ map from position to common argument
-         -> [Term] -- ^ (projections for) uncommon arguments
+         -> [Term] -- ^ (projections for) distinct arguments
          -> [Either Term Type]
 mkDJArgs _ cms []   = map snd cms
 mkDJArgs _ [] uncms = map Left uncms
@@ -359,7 +396,7 @@ mkDJArgs n ((m,x):cms) (y:uncms)
   | n == m    = x       : mkDJArgs (n+1) cms (y:uncms)
   | otherwise = Left y  : mkDJArgs (n+1) ((m,x):cms) uncms
 
--- | Create a case-expression that selects between the uncommon arguments given
+-- | Create a case-expression that selects between the distinct arguments given
 -- a case-tree
 genCase :: Type -- ^ Type of the alternatives
         -> Maybe DataCon -- ^ DataCon to pack multiple arguments
@@ -374,17 +411,17 @@ genCase ty dcM argTys = go
         _ -> head tms
 
     go (LB lb ct) =
-      Letrec (bind (Unbound.rec lb) (go ct))
+      Letrec lb (go ct)
 
     go (Branch scrut [(p,ct)]) =
       let ct' = go ct
-          alt = bind p ct'
-      in  case Lens.setOf termFreeIds ct' == Lens.setOf fv alt of
-            True -> ct'
-            _    -> Case scrut ty [alt]
+          (ptvs,pids) = patIds p
+      in  if (coerce ptvs ++ coerce pids) `varsDoNotOccurIn` ct'
+             then ct'
+             else Case scrut ty [(p,ct')]
 
     go (Branch scrut pats) =
-      Case scrut ty (map (\(p,ct) -> bind p (go ct)) pats)
+      Case scrut ty (map (second go) pats)
 
 -- | Determine if a term in a function position is interesting to lift out of
 -- of a case-expression.
@@ -395,7 +432,7 @@ genCase ty dcM argTys = go
 -- * All non-power-of-two multiplications
 -- * All division-like operations with a non-power-of-two divisor
 interestingToLift
-  :: Set TmOccName
+  :: InScopeSet
   -- ^ in scope
   -> (Term -> Term)
   -- ^ Evaluator
@@ -403,22 +440,22 @@ interestingToLift
   -- ^ Term in function position
   -> [Either Term Type]
   -- ^ Arguments
-  -> Maybe Term
-interestingToLift inScope _ e@(Var _ nm) _ =
-  if nameOcc nm `Set.member` inScope
-     then Just e
-     else Nothing
-interestingToLift inScope eval e@(Prim nm pty) args =
-    case List.lookup nm interestingPrims of
-      Just t | t || not (all isConstant lArgs) -> Just e
-      _ -> if isHOTy pty
-              then if not . null . Maybe.catMaybes $
-                      map (uncurry (interestingToLift inScope eval) .
-                           collectArgs
-                          ) lArgs
-                      then Just e
-                      else Nothing
-              else Nothing
+  -> RewriteMonad extra (Maybe Term)
+interestingToLift inScope _ e@(Var v) _ =
+  if v `elemInScopeSet` inScope
+     then pure (Just e)
+     else pure Nothing
+interestingToLift inScope eval e@(Prim nm pty) args = do
+  anyArgNotConstant <- anyM (fmap not . isConstant) lArgs
+  case List.lookup nm interestingPrims of
+    Just t | t || anyArgNotConstant -> pure (Just e)
+    _ -> do
+      let isInteresting = uncurry (interestingToLift inScope eval) . collectArgs
+      if isHOTy pty then do
+        anyInteresting <- anyM (fmap Maybe.isJust . isInteresting) lArgs
+        if anyInteresting then pure (Just e) else pure Nothing
+      else
+        pure Nothing
 
   where
     interestingPrims =
@@ -488,4 +525,4 @@ interestingToLift inScope eval e@(Prim nm pty) args =
     isHOTy t = case splitFunForallTy t of
       (args',_) -> any isPolyFunTy (Either.rights args')
 
-interestingToLift _ _ _ _ = Nothing
+interestingToLift _ _ _ _ = pure Nothing

@@ -10,6 +10,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell     #-}
 {-# LANGUAGE TupleSections       #-}
+{-# LANGUAGE ViewPatterns #-}
 
 module Clash.GHC.LoadInterfaceFiles
   ( loadExternalExprs
@@ -22,7 +23,7 @@ import           Control.Monad.IO.Class      (MonadIO (..))
 import           Data.Char                   (toLower)
 import           Data.Either                 (partitionEithers)
 import           Data.List                   (elemIndex, foldl', partition)
-import           Data.Maybe                  (fromMaybe, isJust, isNothing,
+import           Data.Maybe                  (isJust, isNothing,
                                               mapMaybe, catMaybes)
 import           Data.Word                   (Word8)
 import           System.Directory            (createDirectoryIfMissing)
@@ -31,7 +32,6 @@ import           System.FilePath.Posix       ((<.>), (</>))
 -- GHC API
 import           Annotations (Annotation(..), getAnnTargetName_maybe)
 import qualified Annotations
-import qualified BasicTypes
 import qualified Class
 import qualified CoreFVs
 import qualified CoreSyn
@@ -44,9 +44,7 @@ import qualified IfaceSyn
 import qualified LoadIface
 import qualified Maybes
 import qualified MkCore
-#if MIN_VERSION_ghc(8,2,0)
 import qualified Module
-#endif
 import qualified MonadUtils
 import qualified Name
 import           Outputable                  (showPpr, showSDoc, text)
@@ -57,9 +55,6 @@ import qualified TcRnTypes
 import qualified UniqFM
 import qualified UniqSet
 import qualified Var
-#if !MIN_VERSION_ghc(8,2,0)
-import qualified VarSet
-#endif
 
 -- Internal Modules
 import           Clash.Annotations.BitRepresentation.Internal
@@ -71,13 +66,8 @@ import           Clash.Util                          (curLoc, traceIf)
 runIfl :: GHC.GhcMonad m => GHC.Module -> TcRnTypes.IfL a -> m a
 runIfl modName action = do
   hscEnv <- GHC.getSession
-#if MIN_VERSION_ghc(8,2,0)
   let localEnv = TcRnTypes.IfLclEnv modName False (text "runIfl") Nothing
                    Nothing UniqFM.emptyUFM UniqFM.emptyUFM
-#else
-  let localEnv = TcRnTypes.IfLclEnv modName (text "runIfl")
-                   UniqFM.emptyUFM UniqFM.emptyUFM
-#endif
   let globalEnv = TcRnTypes.IfGblEnv (text "Clash.runIfl") Nothing
   MonadUtils.liftIO $ TcRnMonad.initTcRnIf 'r' hscEnv globalEnv
                         localEnv action
@@ -87,12 +77,8 @@ loadDecl = TcIface.tcIfaceDecl False
 
 loadIface :: GHC.Module -> TcRnTypes.IfL (Maybe GHC.ModIface)
 loadIface foundMod = do
-#if MIN_VERSION_ghc(8,2,0)
   ifaceFailM <- LoadIface.findAndReadIface (Outputable.text "loadIface")
                   (fst (Module.splitModuleInsts foundMod)) foundMod False
-#else
-  ifaceFailM <- LoadIface.findAndReadIface (Outputable.text "loadIface") foundMod False
-#endif
   case ifaceFailM of
     Maybes.Succeeded (modInfo,_) -> return (Just modInfo)
     Maybes.Failed msg -> let msg' = concat [ $(curLoc)
@@ -103,9 +89,10 @@ loadIface foundMod = do
                                            ]
                          in traceIf True msg' (return Nothing)
 
-loadExternalExprs ::
-  GHC.GhcMonad m
-  => HDL
+loadExternalExprs
+  :: GHC.GhcMonad m
+  => FilePath
+  -> HDL
   -> UniqSet.UniqSet CoreSyn.CoreBndr
   -> [CoreSyn.CoreBind]
   -> m ( [(CoreSyn.CoreBndr,CoreSyn.CoreExpr)] -- Binders
@@ -114,7 +101,7 @@ loadExternalExprs ::
        , [FilePath]
        , [DataRepr']
        )
-loadExternalExprs hdl = go [] [] [] [] []
+loadExternalExprs tmpDir hdl = go [] [] [] [] []
   where
     go locatedExprs clsOps unlocated pFP reprs _ [] =
       return (locatedExprs,clsOps,unlocated,pFP,reprs)
@@ -149,7 +136,7 @@ loadExternalExprs hdl = go [] [] [] [] []
                           (elemIndex v clsIds)
             ) clsOps'
 
-      (locatedAndUnlocated, pFP', reprs') <- unzip3 <$> mapM (loadExprFromIface hdl) fvs'
+      (locatedAndUnlocated, pFP', reprs') <- unzip3 <$> mapM (loadExprFromIface tmpDir hdl) fvs'
       let (locatedExprs', unlocated') = partitionEithers locatedAndUnlocated
 
       let visited' = foldl' UniqSet.addListToUniqSet visited
@@ -168,7 +155,8 @@ loadExternalExprs hdl = go [] [] [] [] []
 
 loadExprFromIface ::
   GHC.GhcMonad m
-  => HDL
+  => FilePath
+  -> HDL
   -> CoreSyn.CoreBndr
   -> m (Either
           (CoreSyn.CoreBndr,CoreSyn.CoreExpr) -- Located
@@ -176,12 +164,8 @@ loadExprFromIface ::
        ,[FilePath]
        ,[DataRepr']
        )
-loadExprFromIface hdl bndr = do
-  dflags <- GHC.getSessionDynFlags
-
-  let -- Using the stub directory as the output directory for inline primitives
-      outDir = fromMaybe "." $ GHC.stubDir dflags
-      moduleM = Name.nameModule_maybe $ Var.varName bndr
+loadExprFromIface tmpDir hdl bndr = do
+  let moduleM = Name.nameModule_maybe $ Var.varName bndr
   case moduleM of
     Just nameMod -> runIfl nameMod $ do
       ifaceM <- loadIface nameMod
@@ -190,13 +174,9 @@ loadExprFromIface hdl bndr = do
         Just iface -> do
           let decls = map snd (GHC.mi_decls iface)
           let nameFun = GHC.getOccName $ Var.varName bndr
-#if MIN_VERSION_ghc(8,2,0)
           let declM = filter ((== nameFun) . Name.nameOccName . IfaceSyn.ifName) decls
-#else
-          let declM = filter ((== nameFun) . IfaceSyn.ifName) decls
-#endif
           anns <- TcIface.tcIfaceAnnotations (GHC.mi_anns iface)
-          primFPs   <- loadPrimitiveAnnotations hdl outDir anns
+          primFPs   <- loadPrimitiveAnnotations hdl tmpDir anns
           let reprs  = loadCustomReprAnnotations anns
           case declM of
             [namedDecl] -> do
@@ -240,8 +220,8 @@ loadPrimitiveAnnotations ::
   -> FilePath
   -> [Annotations.Annotation]
   -> m [FilePath]
-loadPrimitiveAnnotations hdl outDir anns =
-  sequence $ mapMaybe (primitiveFilePath hdl outDir) prims
+loadPrimitiveAnnotations hdl tmpDir anns =
+  sequence $ mapMaybe (primitiveFilePath hdl tmpDir) prims
   where
     prims = mapMaybe filterPrim anns
     filterPrim (Annotations.Annotation target value) =
@@ -256,7 +236,7 @@ primitiveFilePath ::
   -> FilePath
   -> (Annotations.CoreAnnTarget, Primitive)
   -> Maybe (m FilePath)
-primitiveFilePath hdl outDir targetPrim =
+primitiveFilePath hdl tmpDir targetPrim =
   case targetPrim of
     (_, Primitive hdl' fp)
       | hdl == hdl' -> Just $ pure fp
@@ -267,7 +247,7 @@ primitiveFilePath hdl outDir targetPrim =
                 Annotations.NamedTarget name -> Name.nameStableString name
                 Annotations.ModuleTarget mod' -> Module.moduleStableString mod'
             inlinePrimsDir =
-              outDir </> "inline_primitives" </> map toLower (show hdl)
+              tmpDir </> "inline_primitives" </> map toLower (show hdl)
             primFile = inlinePrimsDir </> qualifiedName <.> "json"
         createDirectoryIfMissing True inlinePrimsDir
         writeFile primFile content
@@ -283,14 +263,9 @@ loadExprFromTyThing bndr tyThing = case tyThing of
   GHC.AnId _id | Var.isId _id ->
     let _idInfo    = Var.idInfo _id
         unfolding  = IdInfo.unfoldingInfo _idInfo
-        inlineInfo = IdInfo.inlinePragInfo _idInfo
     in case unfolding of
       CoreSyn.CoreUnfolding {} ->
-        case (BasicTypes.inl_inline inlineInfo,BasicTypes.inl_act inlineInfo) of
-          (BasicTypes.NoInline,BasicTypes.AlwaysActive) -> Right bndr
-          (BasicTypes.NoInline,BasicTypes.NeverActive)  -> Right bndr
-          (BasicTypes.NoInline,_) -> Left (bndr, CoreSyn.unfoldingTemplate unfolding)
-          _ -> Left (bndr, CoreSyn.unfoldingTemplate unfolding)
+        Left (bndr, CoreSyn.unfoldingTemplate unfolding)
       (CoreSyn.DFunUnfolding dfbndrs dc es) ->
         let dcApp  = MkCore.mkCoreConApps dc es
             dfExpr = MkCore.mkCoreLams dfbndrs dcApp

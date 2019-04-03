@@ -3,7 +3,7 @@ module I2C.Types where
 import Clash.Prelude
 
 data I2CCommand = I2Cstart | I2Cstop | I2Cwrite | I2Cread | I2Cnop
-  deriving (Eq, Ord)
+  deriving (Eq, Ord, Generic, Undefined)
 
 type BitCtrlSig = (I2CCommand,Bit)
 type BitRespSig = (Bool,Bool,Bit)

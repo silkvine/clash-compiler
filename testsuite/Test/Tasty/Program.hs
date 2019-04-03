@@ -66,25 +66,28 @@ module Test.Tasty.Program (
    testProgram
  , testFailingProgram
  , PrintOutput(..)
+ , GlobArgs(..)
  ) where
 
-import Control.Exception       ( finally )
-import Control.DeepSeq         ( deepseq                                  )
 import Data.Typeable           ( Typeable                                 )
-import System.Directory        ( findExecutable                           )
+import Data.Maybe              ( fromMaybe                                )
+import System.FilePath.Glob    ( globDir1, compile                        )
+import System.Directory        ( findExecutable, getCurrentDirectory      )
 import System.Exit             ( ExitCode(..)                             )
-import System.Process          ( runInteractiveProcess, waitForProcess    )
+import System.Process          ( cwd, readCreateProcessWithExitCode, proc )
 import Test.Tasty.Providers    ( IsTest (..), Result, TestName, TestTree,
                                  singleTest, testPassed, testFailed       )
-import Control.Concurrent.Lock ( Lock, acquire, release )
 
 import NeatInterpolation    ( text )
 
-import Text.Regex.PCRE ((=~))
-import Text.Regex.PCRE.Text ()
-
 import qualified Data.Text    as T
-import qualified Data.Text.IO as T
+
+
+data GlobArgs
+  = GlobStar
+  -- ^ Glob all argument with a star (*) in them
+  | NoGlob
+  -- ^ No globbing here, mister
 
 
 data PrintOutput
@@ -100,38 +103,36 @@ data TestProgram =
     -- ^ Executable
     [String]
     -- ^ Executable args
+    GlobArgs
+    -- ^ Whether to interpret glob patterns in arguments
     PrintOutput
     -- ^ What output to print on test success
     Bool
     -- ^ Whether an empty stderr means test failure
-    (IO FilePath)
+    (Maybe FilePath)
     -- ^ Work directory
-    (IO (Maybe Lock, Maybe Lock))
-    -- ^ Locks to wait for / release when ready. This is a poor man's
-    -- implementation of threaded tests, currently unsupported by
-    -- Tasty. See: <https://github.com/feuerbach/tasty/issues/48>.
       deriving (Typeable)
 
 data TestFailingProgram =
   TestFailingProgram
+    Bool
+    -- ^ Test exit code
     String
     -- ^ Executable
     [String]
     -- ^ Executable args
+    GlobArgs
+    -- ^ Whether to interpret glob patterns in arguments
     PrintOutput
     -- ^ What output to print on test success
     Bool
     -- ^ Whether an empty stderr means test failure
     (Maybe Int)
     -- ^ Expected return code
-    (Maybe String)
-    -- ^ Expected string in stderr (regular expression)
-    (IO FilePath)
+    (Maybe T.Text)
+    -- ^ Expected string in stderr
+    (Maybe FilePath)
     -- ^ Work directory
-    (IO (Maybe Lock, Maybe Lock))
-    -- ^ Locks to wait for / release when ready. This is a poor man's
-    -- implementation of threaded tests, currently unsupported by
-    -- Tasty. See: <https://github.com/feuerbach/tasty/issues/48>.
       deriving (Typeable)
 
 testOutput
@@ -153,6 +154,19 @@ testOutput PrintBoth     stderr  stdout = [text|
   $stdout
   |]
 
+globArgs
+  :: GlobArgs
+  -> Maybe FilePath
+  -> [String]
+  -> IO [String]
+globArgs NoGlob _dir args = return args
+globArgs GlobStar dir args = do
+  cwd0 <- getCurrentDirectory
+  concat <$> mapM (globArg' cwd0) args
+  where
+    globArg' cwd1 arg
+      | '*' `elem` arg = globDir1 (compile arg) (fromMaybe cwd1 dir)
+      | otherwise      = return [arg]
 
 -- | Create test that runs a program with given options. Test succeeds
 -- if program terminates successfully.
@@ -162,30 +176,32 @@ testProgram
   -> String
   -- ^ Program name
   -> [String]
-  -- ^ Program options
+  -- ^ Program arguments
+  -> GlobArgs
+  -- ^ Whether to interpret glob patterns in arguments
   -> PrintOutput
   -- ^ What output to print on test success
   -> Bool
   -- ^ Whether a non-empty stdout means failure
-  -> IO FilePath
+  -> Maybe FilePath
   -- ^ Optional working directory
-  -> IO (Maybe Lock, Maybe Lock)
-  -- ^ Locks to wait for / release when ready. This is a poor man's
-  -- implementation of threaded tests, currently unsupported by
-  -- Tasty. See: <https://github.com/feuerbach/tasty/issues/48>.
   -> TestTree
-testProgram testName program opts stdO stdF workDir locks =
-  singleTest testName (TestProgram program opts stdO stdF workDir locks)
+testProgram testName program opts glob stdO stdF workDir =
+  singleTest testName (TestProgram program opts glob stdO stdF workDir)
 
 -- | Create test that runs a program with given options. Test succeeds
 -- if program terminates with error
 testFailingProgram
-  :: TestName
+  :: Bool
+  -- ^ Test exit code?
+  -> TestName
   -- ^ Test name
   -> String
   -- ^ Program name
   -> [String]
   -- ^ Program options
+  -> GlobArgs
+  -- ^ Whether to interpret glob patterns in arguments
   -> PrintOutput
   -- ^ Whether to print stdout or stderr on success
   -> Bool
@@ -193,61 +209,37 @@ testFailingProgram
   -> Maybe Int
   -- ^ Expected error code. Test will *only* succeed if program fails and the
   -- returned error code is equal to the given one.
-  -> (Maybe String)
-  -- ^ Expected string in stderr (regular expression)
-  -> IO FilePath
+  -> (Maybe T.Text)
+  -- ^ Expected string in stderr
+  -> Maybe FilePath
   -- ^ Optional working directory
-  -> IO (Maybe Lock, Maybe Lock)
-  -- ^ Locks to wait for / release when ready. This is a poor man's
-  -- implementation of threaded tests, currently unsupported by
-  -- Tasty. See: <https://github.com/feuerbach/tasty/issues/48>.
   -> TestTree
-testFailingProgram testName program opts stdO stdF errCode expectedOutput workDir locks =
-  singleTest testName (TestFailingProgram program opts stdO stdF errCode expectedOutput workDir locks)
+testFailingProgram testExitCode testName program opts glob stdO stdF errCode expectedOutput workDir =
+  singleTest testName (TestFailingProgram testExitCode program opts glob stdO stdF errCode expectedOutput workDir)
 
 instance IsTest TestProgram where
-  run opts (TestProgram program args stdO stdF workDir locks) _ = do
-    (prevLock, nextLock) <- locks
-
+  run opts (TestProgram program args glob stdO stdF workDir) _ = do
     execFound <- findExecutable program
 
-    -- Wait for previous test to finish
-    maybe (return ()) acquire prevLock
+    args' <- globArgs glob workDir args
 
     -- Execute program
-    let result =
-          case execFound of
-            Nothing       -> return $ execNotFoundFailure program
-            Just progPath -> runProgram progPath args stdO stdF =<< workDir
-
-    finally
-      -- Calculate result
-      result
-      -- Release lock of next test (if applicable), even if error was thrown
-      (maybe (return ()) release nextLock)
+    case execFound of
+      Nothing       -> return $ execNotFoundFailure program
+      Just progPath -> runProgram progPath args' stdO stdF workDir
 
   testOptions = return []
 
 instance IsTest TestFailingProgram where
-  run _opts (TestFailingProgram program args stdO stdF errCode expectedOutput workDir locks) _ = do
-    (prevLock, nextLock) <- locks
-
+  run _opts (TestFailingProgram testExitCode program args glob stdO stdF errCode expectedOutput workDir) _ = do
     execFound <- findExecutable program
 
-    -- Wait for previous test to finish
-    maybe (return ()) acquire prevLock
+    args' <- globArgs glob workDir args
 
     -- Execute program
-    let result =
-          case execFound of
-            Nothing       -> return $ execNotFoundFailure program
-            Just progPath -> runFailingProgram progPath args stdO stdF errCode expectedOutput =<< workDir
-
-    finally
-      -- Calculate result
-      result
-      -- Release lock of next test (if applicable), even if error was thrown
-      (maybe (return ()) release nextLock)
+    case execFound of
+      Nothing       -> return $ execNotFoundFailure program
+      Just progPath -> runFailingProgram testExitCode progPath args stdO stdF errCode expectedOutput workDir
 
   testOptions = return []
 
@@ -262,30 +254,35 @@ runProgram
   -- ^ Whether to print stdout or stderr on success
   -> Bool
   -- ^ Whether a non-empty stdout means failure
-  -> FilePath
+  -> Maybe FilePath
   -- ^ Optional working directory
   -> IO Result
 runProgram program args stdO stdF workDir = do
-  (_, stdoutH, stderrH, pid) <- runInteractiveProcess program args (Just workDir) Nothing
+  let cp = (proc program args) { cwd = workDir }
+  (exitCode, stdout, stderr) <- readCreateProcessWithExitCode cp ""
 
-  stderr <- T.hGetContents stderrH
-  stdout <- T.hGetContents stdoutH
-  ecode  <- stdout `deepseq` stderr `deepseq` waitForProcess pid
+  -- For debugging: Uncomment this to print executable and and its arguments
+  --putStrLn $ show program ++ " " ++ concatMap (++ " ") args
 
-  case ecode of
+  let stdoutT = T.pack stdout
+      stderrT = T.pack stderr
+
+  case exitCode of
     ExitSuccess ->
-      if stdF && not (T.null stdout)
-        then return (exitFailure program 1 stderr stdout)
-        else return (testPassed $ T.unpack $ testOutput stdO stderr stdout)
+      if stdF && not (null stdout)
+        then return (exitFailure program 1 stderrT stdoutT)
+        else return (testPassed $ T.unpack $ testOutput stdO stderrT stdoutT)
     ExitFailure code ->
-      return $ exitFailure program code stderr stdout
+      return $ exitFailure program code stderrT stdoutT
 
 -- | Run a program with given options and optional working directory.
 -- Return success if program exists with error code. Fails if program does
 -- not return (an expected) error code or if the program fails to execute at
 -- all.
 runFailingProgram
-  :: String
+  :: Bool
+  -- ^ Test exit code?
+  -> String
   -- ^ Program name
   -> [String]
   -- ^ Program options
@@ -296,36 +293,50 @@ runFailingProgram
   -> Maybe Int
   -- ^ Expected error code. Test will *only* succeed if program fails and the
   -- returned error code is equal to the given one.
-  -> (Maybe String)
-  -- ^ Expected string in stderr (regular expression)
-  -> FilePath
+  -> Maybe T.Text
+  -- ^ Expected string in stderr
+  -> Maybe FilePath
   -- ^ Optional working directory
   -> IO Result
-runFailingProgram program args stdO errOnEmptyStderr expectedCode expectedStderr workDir = do
-  (_, stdoutH, stderrH, pid) <- runInteractiveProcess program args (Just workDir) Nothing
+runFailingProgram testExitCode program args stdO errOnEmptyStderr expectedCode expectedStderr workDir = do
+  let cp = (proc program args) { cwd = workDir }
+  (exitCode0, stdout, stderr) <- readCreateProcessWithExitCode cp ""
 
-  stderr <- T.hGetContents stderrH
-  stdout <- T.hGetContents stdoutH
-  ecode  <- stdout `deepseq` stderr `deepseq` waitForProcess pid
+  -- For debugging: Uncomment this to print executable and and its arguments
+  --putStrLn $ show program ++ " " ++ concatMap (++ " ") args
 
-  let passed = testPassed (T.unpack $ testOutput stdO stderr stdout)
+  let stdoutT = T.pack stdout
+      stderrT = T.pack stderr
 
-  return $ case ecode of
-    ExitSuccess ->
-      unexpectedSuccess program stderr stdout
-    ExitFailure code ->
-      if errOnEmptyStderr && T.null stderr
-        then
-          unexpectedEmptyStderr program code stdout
+      passed = testPassed (T.unpack $ testOutput stdO stderrT stdoutT)
+
+  return (go (stdoutT, stderrT, stdout, stderr, passed) exitCode0)
+
+ where
+  -- TODO: Clean up this code..
+  go e@(stdoutT, stderrT, _stdout, stderr, passed) exitCode1 =
+    case exitCode1 of
+      ExitSuccess ->
+        if testExitCode then
+          unexpectedSuccess program stderrT stdoutT
         else
-          case expectedStderr of
-            Just r | not ((stderr =~ T.pack r) :: Bool) ->
-              unexpectedStderr program code stderr stdout r
-            _ ->
-              case expectedCode of
-                Nothing -> passed
-                Just n | n == code -> passed
-                       | otherwise -> unexpectedCode program code n stderr stdout
+          go e (ExitFailure 0)
+      ExitFailure code ->
+        if errOnEmptyStderr && null stderr
+          then
+            unexpectedEmptyStderr program code stdoutT
+          else
+            case expectedStderr of
+              Just r | not (r `T.isInfixOf` stderrT) ->
+                unexpectedStderr program code stderrT stdoutT r
+              _ ->
+                if testExitCode then
+                  passed
+                else
+                  case expectedCode of
+                    Nothing -> passed
+                    Just n | n == code -> passed
+                           | otherwise -> unexpectedCode program code n stderrT stdoutT
 
 
 -- | Indicates that program does not exist in the path
@@ -355,10 +366,10 @@ unexpectedStderr
   -- ^ stderr
   -> T.Text
   -- ^ stdout
-  -> String
-  -- ^ Expected stderr (regular expression)
+  -> T.Text
+  -- ^ Expected stderr
   -> Result
-unexpectedStderr (T.pack -> file) (showT -> code) stderr stdout (T.pack -> expectedStderr) =
+unexpectedStderr (T.pack -> file) (showT -> code) stderr stdout expectedStderr =
   testFailed $ T.unpack $ [text|
     Program $file did not print expected output to stderr. We expected:
 

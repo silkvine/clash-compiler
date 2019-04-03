@@ -2,12 +2,12 @@ Name:                 clash-lib
 Version:              0.99
 Synopsis:             CAES Language for Synchronous Hardware - As a Library
 Description:
-  CλaSH (pronounced ‘clash’) is a functional hardware description language that
-  borrows both its syntax and semantics from the functional programming language
-  Haskell. The CλaSH compiler transforms these high-level descriptions to
-  low-level synthesizable VHDL, Verilog, or SystemVerilog.
+  Clash is a functional hardware description language that borrows both its
+  syntax and semantics from the functional programming language Haskell. The
+  Clash compiler transforms these high-level descriptions to low-level
+  synthesizable VHDL, Verilog, or SystemVerilog.
   .
-  Features of CλaSH:
+  Features of Clash:
   .
   * Strongly typed, but with a very high degree of type inference, enabling both
     safe and fast prototyping using concise descriptions.
@@ -57,6 +57,7 @@ Build-type:           Simple
 Extra-source-files:
   README.md,
   CHANGELOG.md
+  src/ClashDebug.h
 
 Data-files:
   prims/common/*.json,
@@ -70,6 +71,12 @@ Cabal-version:        >=1.10
 source-repository head
   type: git
   location: https://github.com/clash-lang/clash-compiler.git
+
+flag debug
+   description:
+     Build a debug compiler
+   default: False
+   manual: True
 
 Library
   HS-Source-Dirs:     src
@@ -97,9 +104,11 @@ Library
                       ViewPatterns
 
   Build-depends:      aeson                   >= 0.6.2.0  && < 1.5,
+                      ansi-terminal           >= 0.8.0.0  && < 0.9,
                       ansi-wl-pprint          >= 0.6.8.2  && < 1.0,
                       attoparsec              >= 0.10.4.0 && < 0.14,
                       base                    >= 4.8      && < 5,
+                      binary                  >= 0.8.5    && < 0.11,
                       bytestring              >= 0.10.0.2 && < 0.11,
                       clash-prelude           >= 0.11.1   && < 1.0,
                       concurrent-supply       >= 0.1.7    && < 0.2,
@@ -108,11 +117,11 @@ Library
                       deepseq                 >= 1.3.0.2  && < 1.5,
                       directory               >= 1.2.0.1  && < 1.4,
                       errors                  >= 1.4.2    && < 2.4,
-                      fgl                     >= 5.4.2.4  && < 5.7,
+                      exceptions              >= 0.8.3    && < 0.11.0,
                       filepath                >= 1.3.0.1  && < 1.5,
-                      ghc                     >= 8.0.2    && < 8.8,
+                      ghc                     >= 8.2.0    && < 8.8,
                       hashable                >= 1.2.1.0  && < 1.3,
-                      hint                    >= 0.7      && < 0.9,
+                      hint                    >= 0.7      && < 0.10,
                       integer-gmp             >= 1.0      && < 1.1,
                       lens                    >= 3.9.2    && < 4.18,
                       mtl                     >= 2.1.2    && < 2.3,
@@ -123,12 +132,13 @@ Library
                       reducers                >= 3.12.2   && < 4.0,
                       template-haskell        >= 2.8.0.0  && < 2.15,
                       temporary               >= 1.2      && < 1.4,
-                      text                    >= 0.11.3.1 && < 1.3,
+                      text                    >= 1.2.2    && < 1.3,
+                      text-show               >= 3.7      && < 3.8,
                       time                    >= 1.4.0.1  && < 1.10,
-                      transformers            >= 0.3.0.0  && < 0.6,
+                      transformers            >= 0.5.2.0  && < 0.6,
                       trifecta                >= 1.7.1.1  && < 2.0,
                       vector                  >= 0.11     && < 1.0,
-                      unbound-generics        >= 0.1      && < 0.4,
+                      vector-binary-instances >= 0.2.3.5  && < 0.3,
                       unordered-containers    >= 0.2.3.3  && < 0.3
 
   Exposed-modules:    Clash.Annotations.BitRepresentation.ClashLib
@@ -151,6 +161,7 @@ Library
                       Clash.Core.TysPrim
                       Clash.Core.Util
                       Clash.Core.Var
+                      Clash.Core.VarEnv
 
                       Clash.Driver
                       Clash.Driver.Types
@@ -175,13 +186,18 @@ Library
                       Clash.Primitives.Types
                       Clash.Primitives.Util
 
+                      Clash.Primitives.GHC.Int
+                      Clash.Primitives.GHC.Literal
+                      Clash.Primitives.GHC.Word
                       Clash.Primitives.Intel.ClockGen
 
                       Clash.Rewrite.Combinators
                       Clash.Rewrite.Types
                       Clash.Rewrite.Util
 
+                      Clash.Unique
                       Clash.Util
+                      Clash.Util.Graph
 
                       Data.Text.Prettyprint.Doc.Extra
 
@@ -192,4 +208,6 @@ Library
                       GHC.BasicTypes.Extra
                       GHC.SrcLoc.Extra
                       Paths_clash_lib
-                      Unbound.Generics.LocallyNameless.Extra
+
+  if flag(debug)
+    cpp-options:      -DDEBUG

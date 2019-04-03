@@ -1,9 +1,16 @@
 -- there are no top level packages. any package can be checked out under the
 -- root directory (i.e. patched copies, or forks) and will automatically be
 -- preferred by the solver over other versions.
-packages: ./clash-ghc/*.cabal, ./clash-lib/*.cabal, ./clash-prelude/*.cabal, ./testsuite/*.cabal
+packages:
+  ./clash-ghc/*.cabal,
+  ./clash-lib/*.cabal,
+  ./clash-prelude/*.cabal,
+  ./testsuite/*.cabal,
+  ./benchmark/*.cabal
+  ./benchmark/profiling/prepare/*.cabal
+  ./benchmark/profiling/run/*.cabal
 
-allow-newer: *:Cabal, *:array, *:base, *:binary, *:bytestring, *:containers,
+allow-newer: *:Cabal, *:array, *:base, *:binary, *:^bytestring, *:containers,
   *:deepseq, *:directory, *:filepath, *:ghc, *:ghc-boot, *:ghc-boot-th,
   *:ghc-compact, *:ghc-heap, *:ghc-prim, *:ghci, *:haskeline, *:hpc,
   *:integer-gmp, *:libiserv, *:mtl, *:parsec, *:pretty, *:process, *:stm,
@@ -22,21 +29,22 @@ repository head.hackage
 -- index state, to go along with the cabal.project.freeze file. update the index
 -- state by running `cabal update` twice and looking at the index state it
 -- displays to you (as the second update will be a no-op)
-index-state: 2018-07-03T07:02:43Z
+index-state: 2018-12-12T14:50:52Z
 
 package clash-ghc
   executable-dynamic: True
 
+package clash-prelude
+  -- workaround for plugins not loading in Haddock with GHC-8.6
+  haddock-options: --optghc=-fdefer-type-errors
+
 package clash-testsuite
   flags: cosim
 
-optional-packages: ghc-typelits-extra/ghc-typelits-extra.cabal
-                   ghc-typelits-knownnat/ghc-typelits-knownnat.cabal
-                   ghc-typelits-natnormalise/ghc-typelits-natnormalise.cabal
-                   ghc-tcplugins-extra/ghc-tcplugins-extra.cabal
-                   singletons/th-desugar/th-desugar.cabal
-                   singletons/singletons.cabal
-                   clash-cosim/clash-cosim.cabal
+package clash-lib
+  flags: debug
+
+optional-packages: clash-cosim/clash-cosim.cabal
 
 -- Build documentation for all dependencies so we can upload docs to hackage
 -- with proper links

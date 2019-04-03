@@ -9,15 +9,16 @@ import Data.Singletons.Prelude hiding (type (+))
 import Data.Singletons.Prelude
 #endif
 import Data.Proxy
+import Data.Kind (Type)
 
-data IIndex (f :: TyFun Nat *) :: *
+data IIndex (f :: TyFun Nat Type) :: Type
 type instance Apply IIndex l = Index ((2^l)+1)
 
 populationCount :: (KnownNat k, KnownNat (2^k))
                 => BitVector (2^k) -> Index ((2^k)+1)
 populationCount bv = dtfold (Proxy :: Proxy IIndex)
                             fromIntegral
-                            (\_ x y -> plus x y)
+                            (\_ x y -> add x y)
                             (bv2v bv)
 
 topEntity :: BitVector 16 -> Index 17

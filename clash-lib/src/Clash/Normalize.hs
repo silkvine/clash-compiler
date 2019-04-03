@@ -8,18 +8,21 @@
   Turn CoreHW terms into normalized CoreHW Terms
 -}
 
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE ViewPatterns    #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TemplateHaskell   #-}
+{-# LANGUAGE ViewPatterns      #-}
+
+{-# OPTIONS_GHC -Wno-unused-imports #-}
 
 module Clash.Normalize where
 
+import Data.Either
+
 import           Control.Concurrent.Supply        (Supply)
-import           Control.Lens                     ((.=),(^.),_2,_5)
+import           Control.Lens                     ((.=),(^.),_1,_4)
 import qualified Control.Lens                     as Lens
 import           Data.Either                      (partitionEithers)
-import           Data.HashMap.Strict              (HashMap)
-import qualified Data.HashMap.Strict              as HashMap
-import qualified Data.HashSet                     as HashSet
 import qualified Data.IntMap                      as IntMap
 import           Data.IntMap.Strict               (IntMap)
 import           Data.List
@@ -30,7 +33,6 @@ import qualified Data.Set                         as Set
 import qualified Data.Set.Lens                    as Lens
 import           Data.Semigroup                   ((<>))
 import           Data.Text.Prettyprint.Doc        (vcat)
-import           Unbound.Generics.LocallyNameless (unembed, runLFreshM)
 
 import           BasicTypes                       (InlineSpec (..))
 import           SrcLoc                           (SrcSpan,noSrcSpan)
@@ -38,35 +40,39 @@ import           SrcLoc                           (SrcSpan,noSrcSpan)
 import           Clash.Annotations.BitRepresentation.Internal
   (CustomReprs)
 import           Clash.Core.Evaluator             (PrimEvaluator)
-import           Clash.Core.FreeVars              (termFreeIds)
-import           Clash.Core.Name                  (Name (..), NameSort (..))
-import           Clash.Core.Pretty                (showDoc, ppr)
-import           Clash.Core.Subst                 (substTms)
-import           Clash.Core.Term                  (Term (..), TmName, TmOccName)
+import           Clash.Core.FreeVars
+  (termFreeIds, idDoesNotOccurIn, idOccursIn)
+import           Clash.Core.Pretty                (showPpr, ppr)
+import           Clash.Core.Subst                 (deShadowTerm, extendIdSubstList, mkSubst, substTm)
+import           Clash.Core.Term                  (Term (..))
 import           Clash.Core.Type                  (Type, splitCoreFunForallTy)
 import           Clash.Core.TyCon
-  (TyCon, TyConName, TyConOccName)
+  (TyConMap, TyConName)
 import           Clash.Core.Util                  (collectArgs, mkApps, termType)
-import           Clash.Core.Var                   (Id,varName)
+import           Clash.Core.Var                   (Id, varName, varType)
+import           Clash.Core.VarEnv
+  (VarEnv, elemVarSet, eltsVarEnv, emptyInScopeSet, emptyVarEnv,
+   extendVarEnv, lookupVarEnv, mapVarEnv, mapMaybeVarEnv, mkInScopeSet,
+   mkVarEnv, mkVarSet, notElemVarEnv, notElemVarSet, nullVarEnv, unionVarEnv)
 import           Clash.Driver.Types
   (BindingMap, ClashOpts (..), DebugLevel (..))
-import           Clash.Netlist.Types              (HWType (..))
+import           Clash.Netlist.Types              (HWType (..), FilteredHWType(..))
 import           Clash.Netlist.Util
-  (splitNormalized, unsafeCoreTypeToHWType)
+  (splitNormalized, coreTypeToHWType')
 import           Clash.Normalize.Strategy
 import           Clash.Normalize.Transformations
-  (appProp, bindConstantVar, caseCon, flattenLet, reduceConst, topLet)
+  (appProp, bindConstantVar, caseCon, flattenLet, reduceConst, topLet,
+   reduceNonRepPrim, removeUnusedExpr)
 import           Clash.Normalize.Types
 import           Clash.Normalize.Util
 import           Clash.Primitives.Types           (CompiledPrimMap)
 import           Clash.Rewrite.Combinators        ((>->),(!->))
 import           Clash.Rewrite.Types
   (RewriteEnv (..), RewriteState (..), bindings, curFun, dbgLevel, extra,
-   tcCache, topEntities, typeTranslator, customReprs)
-import           Clash.Rewrite.Util               (isUntranslatableType,
-                                                   runRewrite,
-                                                   runRewriteSession)
-import Clash.Signal.Internal                      (ResetKind (..))
+   tcCache, topEntities, typeTranslator, customReprs, globalInScope)
+import           Clash.Rewrite.Util
+  (apply, isUntranslatableType, runRewrite, runRewriteSession)
+import           Clash.Signal.Internal            (ResetKind (..))
 import           Clash.Util
 
 -- | Run a NormalizeSession in a given environment
@@ -77,10 +83,10 @@ runNormalization
   -- ^ UniqueSupply
   -> BindingMap
   -- ^ Global Binders
-  -> (CustomReprs -> HashMap TyConOccName TyCon -> Bool -> Type -> Maybe (Either String HWType))
+  -> (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
   -- ^ Hardcoded Type -> HWType translator
   -> CustomReprs
-  -> HashMap TyConOccName TyCon
+  -> TyConMap
   -- ^ TyCon cache
   -> IntMap TyConName
   -- ^ Tuple TyCon cache
@@ -88,9 +94,9 @@ runNormalization
   -- ^ Hardcoded evaluator (delta-reduction)
   -> CompiledPrimMap
   -- ^ Primitive Definitions
-  -> HashMap TmOccName Bool
+  -> VarEnv Bool
   -- ^ Map telling whether a components is part of a recursive group
-  -> [TmOccName]
+  -> [Id]
   -- ^ topEntities
   -> NormalizeSession a
   -- ^ NormalizeSession to run
@@ -98,13 +104,15 @@ runNormalization
 runNormalization opts supply globals typeTrans reprs tcm tupTcm eval primMap rcsMap topEnts
   = runRewriteSession rwEnv rwState
   where
+    globalsInScope = mkInScopeSet . mkVarSet . map (Lens.view _1) $ eltsVarEnv globals
+
     rwEnv     = RewriteEnv
                   (opt_dbgLevel opts)
                   typeTrans
                   tcm
                   tupTcm
                   eval
-                  (HashSet.fromList topEnts)
+                  (mkVarSet topEnts)
                   reprs
 
     rwState   = RewriteState
@@ -114,95 +122,101 @@ runNormalization opts supply globals typeTrans reprs tcm tupTcm eval primMap rcs
                   (error $ $(curLoc) ++ "Report as bug: no curFun",noSrcSpan)
                   0
                   (IntMap.empty, 0)
+                  globalsInScope
                   normState
 
     normState = NormalizeState
-                  HashMap.empty
+                  emptyVarEnv
                   Map.empty
-                  HashMap.empty
+                  emptyVarEnv
                   (opt_specLimit opts)
-                  HashMap.empty
+                  emptyVarEnv
                   (opt_inlineLimit opts)
                   (opt_inlineFunctionLimit opts)
                   (opt_inlineConstantLimit opts)
                   primMap
+                  Map.empty
                   rcsMap
+                  (opt_newInlineStrat opts)
 
 
 normalize
-  :: [TmOccName]
+  :: [Id]
   -> NormalizeSession BindingMap
-normalize []  = return HashMap.empty
+normalize []  = return emptyVarEnv
 normalize top = do
   (new,topNormalized) <- unzip <$> mapM normalize' top
   newNormalized <- normalize (concat new)
-  return (HashMap.union (HashMap.fromList topNormalized) newNormalized)
+  return (unionVarEnv (mkVarEnv topNormalized) newNormalized)
 
 normalize'
-  :: TmOccName
-  -> NormalizeSession ([TmOccName],(TmOccName,(TmName,Type,SrcSpan,InlineSpec,Term)))
+  :: Id
+  -> NormalizeSession ([Id],(Id,(Id,SrcSpan,InlineSpec,Term)))
 normalize' nm = do
-  exprM <- HashMap.lookup nm <$> Lens.use bindings
-  let nmS = showDoc nm
+  exprM <- lookupVarEnv nm <$> Lens.use bindings
+  let nmS = showPpr (varName nm)
   case exprM of
-    Just (nm',ty,sp,inl,tm) -> do
+    Just (nm',sp,inl,tm) -> do
       tcm <- Lens.view tcCache
-      reprs <- Lens.view customReprs
-      let (_,resTy) = splitCoreFunForallTy tcm ty
+      let (_,resTy) = splitCoreFunForallTy tcm (varType nm')
       resTyRep <- not <$> isUntranslatableType False resTy
       if resTyRep
          then do
-            tmNorm <- makeCached nm (extra.normalized) $ do
-                        curFun .= (nm',sp)
-                        tm' <- rewriteExpr ("normalization",normalization) (nmS,tm)
-                        ty' <- termType tcm tm'
-                        return (nm',ty',sp,inl,tm')
-            let usedBndrs = Lens.toListOf termFreeIds (tmNorm ^. _5)
+            tmNorm <- makeCachedU nm (extra.normalized) $ do
+                        -- We deshadow the term because sometimes GHC gives us
+                        -- code where a local binder has the same unique as a
+                        -- global binder, sometimes causing the inliner to go
+                        -- into a loop. Deshadowing freshens all the bindings
+                        -- to avoid this.
+                        --
+                        -- Additionally, it allows for a much cheaper `appProp`
+                        -- transformation, see Note [AppProp no-shadow invariant]
+                        is0 <- Lens.use globalInScope
+                        let tm1 = deShadowTerm is0 tm
+                        tm2 <- rewriteExpr ("normalization",normalization) (nmS,tm1) (nm',sp)
+                        let ty' = termType tcm tm2
+                        return (nm' {varType = ty'},sp,inl,tm2)
+            let usedBndrs = Lens.toListOf termFreeIds (tmNorm ^. _4)
             traceIf (nm `elem` usedBndrs)
                     (concat [ $(curLoc),"Expr belonging to bndr: ",nmS ," (:: "
-                            , showDoc (tmNorm ^. _2)
+                            , showPpr (varType (tmNorm ^. _1))
                             , ") remains recursive after normalization:\n"
-                            , showDoc (tmNorm ^. _5) ])
+                            , showPpr (tmNorm ^. _4) ])
                     (return ())
-            tyTrans <- Lens.view typeTranslator
-            case clockResetErrors sp reprs tyTrans tcm ty of
-              msgs@(_:_) -> traceIf True (concat (nmS:" (:: ":showDoc (tmNorm ^. _2)
-                              :")\nhas potentially dangerous meta-stability issues:\n\n"
-                              :msgs))
-                              (return ())
-              _ -> return ()
-            prevNorm <- fmap HashMap.keys $ Lens.use (extra.normalized)
+            prevNorm <- mapVarEnv (Lens.view _1) <$> Lens.use (extra.normalized)
             topEnts  <- Lens.view topEntities
-            let toNormalize = filter (not . (`HashSet.member` topEnts))
-                            $ filter (`notElem` (nm:prevNorm)) usedBndrs
+            let toNormalize = filter (`notElemVarSet` topEnts)
+                            $ filter (`notElemVarEnv` (extendVarEnv nm nm prevNorm)) usedBndrs
             return (toNormalize,(nm,tmNorm))
          else do
             let usedBndrs = Lens.toListOf termFreeIds tm
-            prevNorm <- fmap HashMap.keys $ Lens.use (extra.normalized)
+            prevNorm <- mapVarEnv (Lens.view _1) <$> Lens.use (extra.normalized)
             topEnts  <- Lens.view topEntities
-            let toNormalize = filter (not . (`HashSet.member` topEnts))
-                            $ filter (`notElem` (nm:prevNorm)) usedBndrs
+            let toNormalize = filter (`notElemVarSet` topEnts)
+                            $ filter (`notElemVarEnv` (extendVarEnv nm nm prevNorm)) usedBndrs
             lvl <- Lens.view dbgLevel
             traceIf (lvl >= DebugFinal)
                     (concat [$(curLoc), "Expr belonging to bndr: ", nmS, " (:: "
-                            , showDoc ty
+                            , showPpr (varType nm')
                             , ") has a non-representable return type."
-                            , " Not normalising:\n", showDoc tm] )
-                    (return (toNormalize,(nm,(nm',ty,sp,inl,tm))))
+                            , " Not normalising:\n", showPpr tm] )
+                    (return (toNormalize,(nm,(nm',sp,inl,tm))))
     Nothing -> error $ $(curLoc) ++ "Expr belonging to bndr: " ++ nmS ++ " not found"
 
 -- | Rewrite a term according to the provided transformation
 rewriteExpr :: (String,NormRewrite) -- ^ Transformation to apply
-            -> (String,Term) -- ^ Term to transform
+            -> (String,Term)        -- ^ Term to transform
+            -> (Id, SrcSpan)        -- ^ Renew current function being rewritten
             -> NormalizeSession Term
-rewriteExpr (nrwS,nrw) (bndrS,expr) = do
+rewriteExpr (nrwS,nrw) (bndrS,expr) (nm, sp) = do
+  curFun .= (nm, sp)
   lvl <- Lens.view dbgLevel
-  let before = showDoc expr
+  let before = showPpr expr
   let expr' = traceIf (lvl >= DebugFinal)
                 (bndrS ++ " before " ++ nrwS ++ ":\n\n" ++ before ++ "\n")
                 expr
-  rewritten <- runRewrite nrwS nrw expr'
-  let after = showDoc rewritten
+  rewritten <- runRewrite nrwS emptyInScopeSet nrw expr'
+  let after = showPpr rewritten
   traceIf (lvl >= DebugFinal)
     (bndrS ++ " after " ++ nrwS ++ ":\n\n" ++ after ++ "\n") $
     return rewritten
@@ -213,49 +227,47 @@ checkNonRecursive
   :: BindingMap
   -- ^ List of normalized binders
   -> BindingMap
-checkNonRecursive norm = case Maybe.mapMaybe go (HashMap.toList norm) of
-    []  -> norm
-    rcs -> error $ $(curLoc) ++ "Callgraph after normalisation contains following recursive components: "
-                   ++ show (vcat $ runLFreshM $ sequence [ do a' <- ppr a
-                                                              b' <- ppr b
-                                                              return $ a' <> b'
-                                                         | (a,b ) <- rcs
-                                                         ])
-  where
-    go (nm,(_,_,_,_,tm)) =
-      let used = Lens.toListOf termFreeIds tm
-      in  if nm `elem` used
-             then Just (nm,tm)
-             else Nothing
+checkNonRecursive norm = case mapMaybeVarEnv go norm of
+  rcs | nullVarEnv rcs  -> norm
+  rcs -> error $ $(curLoc) ++ "Callgraph after normalisation contains following recursive components: "
+                   ++ show (vcat [ ppr a <> ppr b
+                                 | (a,b) <- eltsVarEnv rcs
+                                 ])
+ where
+  go (nm,_,_,tm) =
+    if nm `idOccursIn` tm
+       then Just (nm,tm)
+       else Nothing
+
 
 -- | Perform general \"clean up\" of the normalized (non-recursive) function
 -- hierarchy. This includes:
 --
 --   * Inlining functions that simply \"wrap\" another function
 cleanupGraph
-  :: TmOccName
+  :: Id
   -> BindingMap
   -> NormalizeSession BindingMap
 cleanupGraph topEntity norm
   | Just ct <- mkCallTree [] norm topEntity
   = do ctFlat <- flattenCallTree ct
-       return (HashMap.fromList $ snd $ callTreeToList [] ctFlat)
+       return (mkVarEnv $ snd $ callTreeToList [] ctFlat)
 cleanupGraph _ norm = return norm
 
-data CallTree = CLeaf   (TmOccName,(TmName,Type,SrcSpan,InlineSpec,Term))
-              | CBranch (TmOccName,(TmName,Type,SrcSpan,InlineSpec,Term)) [CallTree]
+data CallTree = CLeaf   (Id,(Id,SrcSpan,InlineSpec,Term))
+              | CBranch (Id,(Id,SrcSpan,InlineSpec,Term)) [CallTree]
 
 mkCallTree
-  :: [TmOccName]
+  :: [Id]
   -- ^ Visited
   -> BindingMap
   -- ^ Global binders
-  -> TmOccName
+  -> Id
   -- ^ Root of the call graph
   -> Maybe CallTree
 mkCallTree visited bindingMap root
-  | Just rootTm <- HashMap.lookup root bindingMap
-  = let used   = Set.toList $ Lens.setOf termFreeIds $ (rootTm ^. _5)
+  | Just rootTm <- lookupVarEnv root bindingMap
+  = let used   = Set.toList $ Lens.setOf termFreeIds $ (rootTm ^. _4)
         other  = Maybe.mapMaybe (mkCallTree (root:visited) bindingMap) (filter (`notElem` visited) used)
     in  case used of
           [] -> Just (CLeaf   (root,rootTm))
@@ -263,7 +275,7 @@ mkCallTree visited bindingMap root
 mkCallTree _ _ _ = Nothing
 
 stripArgs
-  :: [TmOccName]
+  :: [Id]
   -> [Id]
   -> [Either Term Type]
   -> Maybe [Either Term Type]
@@ -276,74 +288,98 @@ stripArgs allIds []    args = if any mentionsId args
                               `intersect`
                               allIds)
 
-stripArgs allIds (id_:ids) (Left (Var _ nm):args)
-      | varName id_ == nm = stripArgs allIds ids args
-      | otherwise         = Nothing
+stripArgs allIds (id_:ids) (Left (Var nm):args)
+      | id_ == nm = stripArgs allIds ids args
+      | otherwise = Nothing
 stripArgs _ _ _ = Nothing
 
 flattenNode
   :: CallTree
-  -> NormalizeSession (Either CallTree ((TmOccName,Term),[CallTree]))
-flattenNode (CLeaf (nm,(nameSort -> Internal,_,_,_,e))) =
-  return (Right ((nm,e),[]))
-flattenNode c@(CLeaf (nm,(_,_,_,_,e))) = do
-  tcm  <- Lens.view tcCache
-  norm <- splitNormalized tcm e
-  case norm of
-    Right (ids,[(_,bExpr)],_) -> do
-      let (fun,args) = collectArgs (unembed bExpr)
-      case stripArgs (map (nameOcc.varName) ids) (reverse ids) (reverse args) of
-        Just remainder -> return (Right ((nm,mkApps fun (reverse remainder)),[]))
-        Nothing        -> return (Right ((nm,e),[]))
-    _ | isCheapFunction e -> return (Right ((nm,e),[]))
-      | otherwise         -> return (Left c)
-flattenNode (CBranch (nm,(nameSort -> Internal,_,_,_,e)) us) =
-  return (Right ((nm,e),us))
-flattenNode b@(CBranch (nm,(_,_,_,_,e)) us) = do
-  tcm  <- Lens.view tcCache
-  norm <- splitNormalized tcm e
-  case norm of
-    Right (ids,[(_,bExpr)],_) -> do
-      let (fun,args) = collectArgs (unembed bExpr)
-      case stripArgs (map (nameOcc.varName) ids) (reverse ids) (reverse args) of
-        Just remainder -> return (Right ((nm,mkApps fun (reverse remainder)),us))
-        Nothing        -> return (Right ((nm,e),us))
-    _ | isCheapFunction e -> return (Right ((nm,e),us))
-      | otherwise         -> return (Left b)
+  -> NormalizeSession (Either CallTree ((Id,Term),[CallTree]))
+flattenNode c@(CLeaf (_,(_,_,NoInline,_))) = return (Left c)
+flattenNode c@(CLeaf (nm,(_,_,_,e))) = do
+  isTopEntity <- elemVarSet nm <$> Lens.view topEntities
+  if isTopEntity then return (Left c) else do
+    tcm  <- Lens.view tcCache
+    let norm = splitNormalized tcm e
+    case norm of
+      Right (ids,[(bId,bExpr)],_) -> do
+        let (fun,args) = collectArgs bExpr
+        case stripArgs ids (reverse ids) (reverse args) of
+          Just remainder | bId `idDoesNotOccurIn` bExpr ->
+               return (Right ((nm,mkApps fun (reverse remainder)),[]))
+          _ -> return (Right ((nm,e),[]))
+      _ -> return (Right ((nm,e),[]))
+flattenNode b@(CBranch (_,(_,_,NoInline,_)) _) =
+  return (Left b)
+flattenNode b@(CBranch (nm,(_,_,_,e)) us) = do
+  isTopEntity <- elemVarSet nm <$> Lens.view topEntities
+  if isTopEntity then return (Left b) else do
+    tcm  <- Lens.view tcCache
+    let norm = splitNormalized tcm e
+    case norm of
+      Right (ids,[(bId,bExpr)],_) -> do
+        let (fun,args) = collectArgs bExpr
+        case stripArgs ids (reverse ids) (reverse args) of
+          Just remainder | bId `idDoesNotOccurIn` bExpr ->
+               return (Right ((nm,mkApps fun (reverse remainder)),us))
+          _ -> return (Right ((nm,e),us))
+      _ -> do
+        newInlineStrat <- Lens.use (extra.newInlineStrategy)
+        if newInlineStrat || isCheapFunction e
+           then return (Right ((nm,e),us))
+           else return (Left b)
 
 flattenCallTree
   :: CallTree
   -> NormalizeSession CallTree
 flattenCallTree c@(CLeaf _) = return c
-flattenCallTree (CBranch (nm,(nm',ty,sp,inl,tm)) used) = do
+flattenCallTree (CBranch (nm,(nm',sp,inl,tm)) used) = do
+  is <- Lens.use globalInScope
   flattenedUsed   <- mapM flattenCallTree used
   (newUsed,il_ct) <- partitionEithers <$> mapM flattenNode flattenedUsed
   let (toInline,il_used) = unzip il_ct
+      subst = extendIdSubstList (mkSubst is) toInline
   newExpr <- case toInline of
                [] -> return tm
-               _  -> rewriteExpr ("flattenExpr",flatten) (showDoc nm, substTms toInline tm)
+               _  -> do is0 <- Lens.use globalInScope
+                        -- To have a cheap `appProp` transformation we need to
+                        -- deshadow, see also Note [AppProp no-shadow invariant]
+                        let tm1 = deShadowTerm is0 (substTm "flattenCallTree.flattenExpr" subst tm)
+                        rewriteExpr ("flattenExpr",flatten) (showPpr nm, tm1) (nm', sp)
   let allUsed = newUsed ++ concat il_used
   -- inline all components when the resulting expression after flattening
   -- is still considered "cheap". This happens often at the topEntity which
   -- wraps another functions and has some selectors and data-constructors.
-  if isCheapFunction newExpr
+  if inl /= NoInline && isCheapFunction newExpr
      then do
         let (toInline',allUsed') = unzip (map goCheap allUsed)
-        newExpr' <- rewriteExpr ("flattenCheap",flatten) (showDoc nm, substTms toInline' newExpr)
-        return (CBranch (nm,(nm',ty,sp,inl,newExpr')) (concat allUsed'))
-     else return (CBranch (nm,(nm',ty,sp,inl,newExpr)) allUsed)
+            subst' = extendIdSubstList (mkSubst is) toInline'
+        is0 <- Lens.use globalInScope
+        -- To have a cheap `appProp` transformation we need to
+        -- deshadow, see also Note [AppProp no-shadow invariant]
+        let tm1 = deShadowTerm is0 (substTm "flattenCallTree.flattenCheap" subst' newExpr)
+        newExpr' <- rewriteExpr ("flattenCheap",flatten) (showPpr nm, tm1) (nm', sp)
+        return (CBranch (nm,(nm',sp,inl,newExpr')) (concat allUsed'))
+     else return (CBranch (nm,(nm',sp,inl,newExpr)) allUsed)
   where
     flatten =
-      innerMost (appProp >-> bindConstantVar >-> caseCon >-> reduceConst >-> flattenLet) !->
-      topdownSucR topLet
+      innerMost (apply "appProp" appProp >->
+                 apply "bindConstantVar" bindConstantVar >->
+                 apply "caseCon" caseCon >->
+                 apply "reduceConst" reduceConst >->
+                 apply "reduceNonRepPrim" reduceNonRepPrim >->
+                 apply "removeUnusedExpr" removeUnusedExpr >->
+                 apply "flattenLet" flattenLet) !->
+      topdownSucR (apply "topLet" topLet)
 
-    goCheap (CLeaf   (nm2,(_,_,_,_,e)))    = ((nm2,e),[])
-    goCheap (CBranch (nm2,(_,_,_,_,e)) us) = ((nm2,e),us)
+    goCheap (CLeaf   (nm2,(_,_,_,e)))    = ((nm2,e),[])
+    goCheap (CBranch (nm2,(_,_,_,e)) us) = ((nm2,e),us)
 
 callTreeToList
-  :: [TmOccName]
+  :: [Id]
   -> CallTree
-  -> ([TmOccName],[(TmOccName,(TmName,Type,SrcSpan,InlineSpec,Term))])
+  -> ([Id],[(Id,(Id,SrcSpan,InlineSpec,Term))])
 callTreeToList visited (CLeaf (nm,bndr))
   | nm `elem` visited = (visited,[])
   | otherwise         = (nm:visited,[(nm,bndr)])
@@ -352,61 +388,3 @@ callTreeToList visited (CBranch (nm,bndr) used)
   | otherwise         = (visited',(nm,bndr):(concat others))
   where
     (visited',others) = mapAccumL callTreeToList (nm:visited) used
-
--- | Clash's clock and reset domain annotations prevent most accidental
--- meta-stability situations. That is, unless the developer uses the
--- functions marked "unsafe", the type system will prevent things like
--- illegal clock domain crossing, or improper use of asynchronous resets.
---
--- However, this all depends on clock and resets being unique. With explicit
--- clocks and resets, it is possible to have multiple clock and reset arguments
--- that are annotated with the same domain. If these arguments aren't connected
--- to the same source, we can still get metastability due to either illegal
--- clock domain crossing, or improper use of asynchronous resets.
---
--- The following situations are reported:
--- * There are 2 or more clock arguments in scope that have the same clock
---   domain annotation.
--- * There are 2 or more reset arguments in scope that have the same reset
---   domain annotation, and at least one of them is an asynchronous reset.
-clockResetErrors
-  :: SrcSpan
-  -> CustomReprs
-  -> (CustomReprs -> HashMap TyConOccName TyCon -> Bool -> Type -> Maybe (Either String HWType))
-  -> HashMap TyConOccName TyCon
-  -> Type
-  -> [String]
-clockResetErrors sp reprs tyTran tcm ty =
-   (Maybe.mapMaybe reportClock clks ++ Maybe.mapMaybe reportResets rsts)
-  where
-    (args,_)  = splitCoreFunForallTy tcm ty
-    (_,args') = partitionEithers args
-    hwArgs    = zip (map (unsafeCoreTypeToHWType sp $(curLoc) tyTran reprs tcm False) args') args'
-    clks      = groupBy ((==) `on` fst) . sortBy (compare `on` fst)
-              $ [ ((nm,i),ty') | (Clock nm i _,ty') <- hwArgs]
-    rsts      = groupBy ((==) `on` (fst.fst)) . sortBy (compare `on` (fst.fst))
-              $ [ (((nm,i),s),ty') | (Reset nm i s,ty') <- hwArgs]
-
-    reportClock clks'
-      | length clks' >= 2
-      = Just
-      $ concat ["The following clocks:\n"
-               ,concatMap (\c -> "* " ++ showDoc (snd c) ++ "\n") clks'
-               ,"belong to the same clock domain and should be connected to "
-               ,"the same clock source in order to prevent meta-stability "
-               ,"issues."
-               ]
-      | otherwise
-      = Nothing
-
-    reportResets rsts'
-      | length rsts' >= 2
-      , any (\((_,sync),_) -> sync == Asynchronous) rsts'
-      = Just
-      $ concat ["The following resets:\n"
-               ,concatMap (\c -> "* " ++ showDoc (snd c) ++ "\n") rsts'
-               ,"belong to the same reset domain, and one or more of these "
-               ,"resets is Asynchronous. Ensure that these resets are "
-               ,"synchronized in order to prevent meta-stability issues."
-               ]
-    reportResets _ = Nothing

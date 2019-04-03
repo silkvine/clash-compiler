@@ -1,5 +1,4 @@
 {-# LANGUAGE DataKinds #-}
-{-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE TemplateHaskell #-}
 
 module RecordSumOfProducts where
@@ -9,10 +8,10 @@ import Control.Applicative
 
 data DbState = DbInitDisp (Unsigned 4) | DbWriteRam (Signed 14) (Signed 14)
              | DbDone
-    deriving (Show, Eq, Undefined)
+    deriving (Show, Eq, Generic, Undefined)
 
 data DbS = DbS { dbS :: DbState }
-  deriving Undefined
+  deriving (Generic, Undefined)
 
 
 topEntity

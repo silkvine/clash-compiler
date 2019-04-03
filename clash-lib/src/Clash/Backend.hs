@@ -11,11 +11,14 @@ module Clash.Backend where
 
 import Control.Lens                         (Lens')
 import qualified  Control.Lens              as Lens
+import Data.HashMap.Strict                  (HashMap)
+import qualified Data.HashMap.Strict        as HashMap
 import Data.HashSet                         (HashSet)
 import Data.Maybe                           (fromMaybe)
 import Data.Semigroup.Monad                 (Mon (..))
-import qualified Data.Text.Lazy             as T
-import Data.Text.Lazy                       (Text)
+import qualified Data.Text                  as T
+import Data.Text                            (Text)
+import qualified Data.Text.Lazy             as LT
 import Control.Monad.State                  (State)
 import Data.Text.Prettyprint.Doc.Extra      (Doc)
 
@@ -27,7 +30,7 @@ import Clash.Netlist.BlackBox.Types
 
 import Clash.Annotations.Primitive          (HDL)
 
-type ModName = String
+type ModName = Identifier
 
 -- | Is a type used for internal or external use
 data Usage
@@ -38,7 +41,7 @@ data Usage
 
 class Backend state where
   -- | Initial state for state monad
-  initBackend :: Int -> HdlSyn -> state
+  initBackend :: Int -> HdlSyn -> Bool -> state
 
   -- | What HDL is the backend generating
   hdlKind :: state -> HDL
@@ -57,9 +60,9 @@ class Backend state where
   extractTypes     :: state -> HashSet HWType
 
   -- | Generate HDL for a Netlist component
-  genHDL           :: String -> SrcSpan -> [Identifier] -> Component -> Mon (State state) ((String, Doc),[(String,Doc)])
+  genHDL           :: Identifier -> SrcSpan -> HashMap Identifier Word -> Component -> Mon (State state) ((String, Doc),[(String,Doc)])
   -- | Generate a HDL package containing type definitions for the given HWTypes
-  mkTyPackage      :: String -> [HWType] -> Mon (State state) [(String, Doc)]
+  mkTyPackage      :: Identifier -> [HWType] -> Mon (State state) [(String, Doc)]
   -- | Convert a Netlist HWType to a target HDL type
   hdlType          :: Usage -> HWType -> Mon (State state) Doc
   -- | Convert a Netlist HWType to an HDL error value for that type
@@ -69,7 +72,7 @@ class Backend state where
   -- | Create a record selector
   hdlRecSel        :: HWType -> Int -> Mon (State state) Doc
   -- | Create a signal declaration from an identifier (Text) and Netlist HWType
-  hdlSig           :: Text -> HWType -> Mon (State state) Doc
+  hdlSig           :: LT.Text -> HWType -> Mon (State state) Doc
   -- | Create a generative block statement marker
   genStmt          :: Bool -> State state Doc
   -- | Turn a Netlist Declaration to a HDL concurrent block
@@ -79,9 +82,9 @@ class Backend state where
   -- | Bit-width of Int/Word/Integer
   iwWidth          :: State state Int
   -- | Convert to a bit-vector
-  toBV             :: HWType -> Text -> Mon (State state) Doc
+  toBV             :: HWType -> LT.Text -> Mon (State state) Doc
   -- | Convert from a bit-vector
-  fromBV           :: HWType -> Text -> Mon (State state) Doc
+  fromBV           :: HWType -> LT.Text -> Mon (State state) Doc
   -- | Synthesis tool we're generating HDL for
   hdlSyn           :: State state HdlSyn
   -- | mkIdentifier
@@ -99,13 +102,13 @@ class Backend state where
   -- | unextend/unescape identifier
   unextend         :: State state (Identifier -> Identifier)
   addIncludes      :: [(String, Doc)] -> State state ()
-  addLibraries     :: [Text] -> State state ()
-  addImports       :: [Text] -> State state ()
+  addLibraries     :: [LT.Text] -> State state ()
+  addImports       :: [LT.Text] -> State state ()
   addAndSetData    :: FilePath -> State state String
   getDataFiles     :: State state [(String,FilePath)]
   addMemoryDataFile  :: (String,String) -> State state ()
   getMemoryDataFiles :: State state [(String,String)]
-  seenIdentifiers  :: Lens' state [Identifier]
+  seenIdentifiers  :: Lens' state (HashMap Identifier Word)
 
 -- | Replace a normal HDL template placeholder with an unescaped/unextended
 -- template placeholder.
@@ -130,17 +133,19 @@ mkUniqueIdentifier typ nm = do
   extendId <- extendIdentifier
   seen     <- Lens.use seenIdentifiers
   let i = mkId typ nm
-  if i `elem` seen
-     then go extendId (0::Int) seen i
-     else do seenIdentifiers Lens.%= (i:)
-             return i
+  case HashMap.lookup i seen of
+    Just n -> go extendId n seen i
+    Nothing -> do
+     seenIdentifiers Lens.%= (HashMap.insert i 0)
+     return i
  where
   go extendId n seen i = do
     let i' = extendId typ i (T.pack ('_':show n))
-    if i' `elem` seen
-       then go extendId (n+1) seen i
-       else do seenIdentifiers Lens.%= (i':)
-               return i'
+    case HashMap.lookup i' seen of
+       Just _ -> go extendId (n+1) seen i
+       Nothing -> do
+        seenIdentifiers Lens.%= (HashMap.insert i' (n+1))
+        return i'
 
 preserveSeen
   :: Backend s

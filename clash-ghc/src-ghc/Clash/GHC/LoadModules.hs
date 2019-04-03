@@ -16,6 +16,7 @@
 module Clash.GHC.LoadModules
   ( loadModules
   , ghcLibDir
+  , wantedLanguageExtensions
   )
 where
 
@@ -24,18 +25,21 @@ where
 #endif
 
 -- External Modules
-import           Clash.Annotations.Primitive     (HDL, Primitive (..))
+import           Clash.Annotations.Primitive     (HDL, PrimitiveGuard)
 import           Clash.Annotations.TopEntity     (TopEntity (..))
-import           Control.Arrow                   (second)
+import           Control.Arrow                   (first, second)
+import           Control.DeepSeq                 (deepseq)
 #if MIN_VERSION_ghc(8,6,0)
 import           Control.Exception               (throwIO)
 #endif
 import           Control.Monad.IO.Class          (liftIO)
 import           Data.Generics.Uniplate.DataOnly (transform)
+import           Data.Data                       (Data)
+import           Data.Typeable                   (Typeable)
 import           Data.List                       (foldl', lookup, nub)
-import           Data.Maybe                      (catMaybes, fromMaybe,
-                                                  listToMaybe, mapMaybe)
-import           Data.Word                       (Word8)
+import           Data.Maybe                      (catMaybes, listToMaybe, mapMaybe)
+import qualified Data.Text                       as Text
+import qualified Data.Time.Clock                 as Clock
 import           System.Exit                     (ExitCode (..))
 import           System.IO                       (hGetLine)
 import           System.IO.Error                 (tryIOError)
@@ -62,12 +66,7 @@ import qualified TcRnMonad
 import qualified TcRnTypes
 import qualified TidyPgm
 import qualified Unique
-#if MIN_VERSION_ghc(8,2,0)
-import qualified UniqDFM
 import qualified UniqFM
-#else
-import qualified UniqFM
-#endif
 import qualified FamInst
 import qualified FamInstEnv
 import qualified GHC.LanguageExtensions          as LangExt
@@ -76,11 +75,11 @@ import qualified OccName
 import           Outputable                      (ppr)
 import qualified Outputable
 import qualified UniqSet
+import           Util (OverridingBool)
 import qualified Var
 
 -- Internal Modules
-import           Clash.Annotations.BitRepresentation          (DataReprAnn)
-import           Clash.GHC.GHC2Core                           (modNameM)
+import           Clash.GHC.GHC2Core                           (modNameM, qualifiedNameString')
 import           Clash.GHC.LoadInterfaceFiles                 (loadExternalExprs, primitiveFilePath)
 import           Clash.Util                                   (curLoc)
 import           Clash.Annotations.BitRepresentation.Internal
@@ -112,9 +111,18 @@ getProcessOutput command =
      return (output, exitCode)
 
 loadModules
-  :: HDL
+  :: FilePath
+  -- ^ Temporary directory
+  -> OverridingBool
+  -- ^ Use color
+  -> HDL
+  -- ^ HDL target
   -> String
+  -- ^ Module name
   -> Maybe (DynFlags.DynFlags)
+  -- ^ Flags to run GHC with
+  -> [FilePath]
+  -- ^ Import dirs to use when no DynFlags are provided
   -> IO ( [CoreSyn.CoreBind]                     -- Binders
         , [(CoreSyn.CoreBndr,Int)]               -- Class operations
         , [CoreSyn.CoreBndr]                     -- Unlocatable Expressions
@@ -124,10 +132,11 @@ loadModules
            , Maybe CoreSyn.CoreBndr)]            -- (maybe) testBench bndr
         , [FilePath]
         , [DataRepr']
+        , [(Text.Text, PrimitiveGuard ())]
         )
-loadModules hdl modName dflagsM = do
+loadModules tmpDir useColor hdl modName dflagsM idirs = do
   libDir <- MonadUtils.liftIO ghcLibDir
-
+  startTime <- Clock.getCurrentTime
   GHC.runGhc (Just libDir) $ do
     dflags <- case dflagsM of
                 Just df -> return df
@@ -141,58 +150,28 @@ loadModules hdl modName dflagsM = do
 #else
                   df <- GHC.getSessionDynFlags
 #endif
-                  let dfEn = foldl DynFlags.xopt_set df
-                                [ LangExt.TemplateHaskell
-                                , LangExt.TemplateHaskellQuotes
-                                , LangExt.DataKinds
-                                , LangExt.MonoLocalBinds
-                                , LangExt.TypeOperators
-                                , LangExt.FlexibleContexts
-                                , LangExt.ConstraintKinds
-                                , LangExt.TypeFamilies
-                                , LangExt.BinaryLiterals
-                                , LangExt.ExplicitNamespaces
-                                , LangExt.KindSignatures
-                                , LangExt.DeriveLift
-                                , LangExt.TypeApplications
-                                , LangExt.ScopedTypeVariables
-                                , LangExt.MagicHash
-                                , LangExt.ExplicitForAll
-                                , LangExt.QuasiQuotes
-                                ]
-                  let dfDis = foldl DynFlags.xopt_unset dfEn
-                                [ LangExt.ImplicitPrelude
-                                , LangExt.MonomorphismRestriction
-                                , LangExt.Strict
-                                , LangExt.StrictData
-                                ]
+                  let df1 = wantedLanguageExtensions df
                   let ghcTyLitNormPlugin = GHC.mkModuleName "GHC.TypeLits.Normalise"
                       ghcTyLitExtrPlugin = GHC.mkModuleName "GHC.TypeLits.Extra.Solver"
                       ghcTyLitKNPlugin   = GHC.mkModuleName "GHC.TypeLits.KnownNat.Solver"
-                  let dfPlug = dfDis { DynFlags.pluginModNames = nub $
+                  let dfPlug = df1 { DynFlags.pluginModNames = nub $
                                           ghcTyLitNormPlugin : ghcTyLitExtrPlugin :
-                                          ghcTyLitKNPlugin : DynFlags.pluginModNames dfDis
+                                          ghcTyLitKNPlugin : DynFlags.pluginModNames df1
+                                     , DynFlags.useColor = useColor
+                                     , DynFlags.importPaths = idirs
                                      }
                   return dfPlug
 
     let dflags1 = dflags
                     { DynFlags.optLevel = 2
                     , DynFlags.ghcMode  = GHC.CompManager
-                    , DynFlags.ghcLink  = GHC.NoLink
-#if MIN_VERSION_ghc(8,2,0)
+                    , DynFlags.ghcLink  = GHC.LinkInMemory
                     , DynFlags.hscTarget
                         = if DynFlags.rtsIsProfiled
                              then DynFlags.HscNothing
                              else DynFlags.defaultObjectTarget
                                     (DynFlags.targetPlatform dflags)
-#else
-                    , DynFlags.hscTarget = DynFlags.HscNothing
-#endif
-#if __GLASGOW_HASKELL__ >= 711
                     , DynFlags.reductionDepth = 1000
-#else
-                    , DynFlags.ctxtStkDepth = 1000
-#endif
                     }
     let dflags2 = wantedOptimizationFlags dflags1
     let ghcDynamic = case lookup "GHC Dynamic" (DynFlags.compilerInfo dflags) of
@@ -254,17 +233,22 @@ loadModules hdl modName dflagsM = do
     let (binders,modFamInstEnvs) = unzip tidiedMods
         bindersC                 = concat binders
         binderIds                = map fst (CoreSyn.flattenBinds bindersC)
-#if MIN_VERSION_ghc(8,2,0)
-        modFamInstEnvs'          = foldr UniqDFM.plusUDFM UniqDFM.emptyUDFM modFamInstEnvs
-#else
-        modFamInstEnvs'          = foldr UniqFM.plusUFM UniqFM.emptyUFM modFamInstEnvs
-#endif
+        plusFamInst f1 f2        = FamInstEnv.extendFamInstEnvList f1 (FamInstEnv.famInstEnvElts f2)
+        modFamInstEnvs'          = foldl' plusFamInst FamInstEnv.emptyFamInstEnv modFamInstEnvs
+
+    modTime <- startTime `deepseq` length binderIds `deepseq` MonadUtils.liftIO Clock.getCurrentTime
+    let modStartDiff = Clock.diffUTCTime modTime startTime
+    MonadUtils.liftIO $ putStrLn $ "GHC: Parsing and optimising modules took: " ++ show modStartDiff
 
     (externalBndrs,clsOps,unlocatable,pFP,reprs) <-
-      loadExternalExprs hdl (UniqSet.mkUniqSet binderIds) bindersC
+      loadExternalExprs tmpDir hdl (UniqSet.mkUniqSet binderIds) bindersC
+
+    extTime <- modTime `deepseq` length unlocatable `deepseq` MonadUtils.liftIO Clock.getCurrentTime
+    let extModDiff = Clock.diffUTCTime extTime modTime
+    MonadUtils.liftIO $ putStrLn $ "GHC: Loading external modules from interface files took: " ++ show extModDiff
 
     -- Find local primitive annotations
-    pFP' <- findPrimitiveAnnotations hdl binderIds
+    pFP' <- findPrimitiveAnnotations hdl tmpDir binderIds
 
     hscEnv <- GHC.getSession
 #if MIN_VERSION_ghc(8,6,0)
@@ -285,10 +269,11 @@ loadModules hdl modName dflagsM = do
     -- Because tidiedMods is in topological order, binders is also, and hence
     -- allSyn is in topological order. This means that the "root" 'topEntity'
     -- will be compiled last.
-    allSyn   <- findSynthesizeAnnotations binderIds
-    benchAnn <- findTestBenchAnnotations binderIds
-    topSyn   <- findSynthesizeAnnotations rootIds
-    reprs'   <- findCustomReprAnnotations
+    allSyn     <- map (second Just) <$> findSynthesizeAnnotations binderIds
+    topSyn     <- map (second Just) <$> findSynthesizeAnnotations rootIds
+    benchAnn   <- findTestBenchAnnotations binderIds
+    reprs'     <- findCustomReprAnnotations
+    primGuards <- findPrimitiveGuardAnnotations binderIds
     let varNameString = OccName.occNameString . Name.nameOccName . Var.varName
         topEntities = filter ((== "topEntity") . varNameString) rootIds
         benches     = filter ((== "testBench") . varNameString) rootIds
@@ -315,7 +300,23 @@ loadModules hdl modName dflagsM = do
         (_, _) ->
           Panic.pgmError $ $(curLoc) ++ "Multiple 'topEntities' found."
 
-    return (bindersC ++ makeRecursiveGroups externalBndrs,clsOps,unlocatable,(fst famInstEnvs,modFamInstEnvs'),topEntities',nub $ pFP ++ pFP',reprs++reprs')
+    let pFP1   = nub $ pFP ++ pFP'
+        reprs1 = reprs ++ reprs'
+
+    annTime <- extTime `deepseq` length topEntities' `deepseq` pFP1 `deepseq`
+               reprs1 `deepseq` primGuards `deepseq` MonadUtils.liftIO Clock.getCurrentTime
+    let annExtDiff = Clock.diffUTCTime annTime extTime
+    MonadUtils.liftIO $ putStrLn $ "GHC: Parsing annotations took: " ++ show annExtDiff
+
+    return ( bindersC ++ makeRecursiveGroups externalBndrs
+           , clsOps
+           , unlocatable
+           , (fst famInstEnvs, modFamInstEnvs')
+           , topEntities'
+           , pFP1
+           , reprs1
+           , primGuards
+           )
 
 -- | Given a set of bindings, make explicit non-recursive bindings and
 -- recursive binding groups.
@@ -355,58 +356,105 @@ makeRecursiveGroups
     makeBind (Digraph.AcyclicSCC (b,e)) = CoreSyn.NonRec b e
     makeBind (Digraph.CyclicSCC bs)     = CoreSyn.Rec bs
 
+errOnDuplicateAnnotations
+  :: String
+  -- ^ Name of annotation
+  -> [CoreSyn.CoreBndr]
+  -- ^ Binders searched for
+  -> [[a]]
+  -- ^ Parsed annotations
+  -> [(CoreSyn.CoreBndr, a)]
+errOnDuplicateAnnotations nm bndrs anns =
+  go (zip bndrs anns)
+ where
+  go
+    :: [(CoreSyn.CoreBndr, [a])]
+    -> [(CoreSyn.CoreBndr, a)]
+  go []             = []
+  go ((_, []):ps)   = go ps
+  go ((b, [p]):ps)  = (b, p) : (go ps)
+  go ((b, _):_)  =
+    Panic.pgmError $ "The following value has multiple "
+                  ++ "'" ++ nm ++ "' annotations: "
+                  ++ Outputable.showSDocUnsafe (ppr b)
+
+-- | Find annotations by given targets
+findAnnotationsByTargets
+  :: GHC.GhcMonad m
+  => Typeable a
+  => Data a
+  => [Annotations.AnnTarget Name.Name]
+  -> m [[a]]
+findAnnotationsByTargets targets =
+  mapM (GHC.findGlobalAnns GhcPlugins.deserializeWithData) targets
+
+-- | Find all annotations of a certain type in all modules seen so far.
+findAllModuleAnnotations
+  :: GHC.GhcMonad m
+  => Data a
+  => Typeable a
+  => m [a]
+findAllModuleAnnotations = do
+  hsc_env <- GHC.getSession
+  ann_env <- liftIO $ HscTypes.prepareAnnotations hsc_env Nothing
+  return $ concat
+         $ UniqFM.nonDetEltsUFM
+         $ Annotations.deserializeAnns GhcPlugins.deserializeWithData ann_env
+
+-- | Find all annotations belonging to all binders seen so far.
+findNamedAnnotations
+  :: GHC.GhcMonad m
+  => Data a
+  => Typeable a
+  => [CoreSyn.CoreBndr]
+  -> m [[a]]
+findNamedAnnotations bndrs =
+  findAnnotationsByTargets (map (Annotations.NamedTarget . Var.varName) bndrs)
+
+findPrimitiveGuardAnnotations
+  :: GHC.GhcMonad m
+  => [CoreSyn.CoreBndr]
+  -> m [(Text.Text, (PrimitiveGuard ()))]
+findPrimitiveGuardAnnotations bndrs = do
+  anns0 <- findNamedAnnotations bndrs
+  let anns1 = errOnDuplicateAnnotations "PrimitiveGuard" bndrs anns0
+  pure (map (first (qualifiedNameString' . Var.varName)) anns1)
+
+-- | Find annotations of type @DataReprAnn@ and convert them to @DataRepr'@
 findCustomReprAnnotations
   :: GHC.GhcMonad m
   => m [DataRepr']
-findCustomReprAnnotations = do
-  hsc_env <- GHC.getSession
-  ann_env <- liftIO $ HscTypes.prepareAnnotations hsc_env Nothing
+findCustomReprAnnotations =
+  map dataReprAnnToDataRepr' <$> findAllModuleAnnotations
 
-  let deserializer = GhcPlugins.deserializeWithData :: [Word8] -> DataReprAnn
-  let deserialized = Annotations.deserializeAnns deserializer ann_env
-  let reprs        = concat $ UniqFM.nonDetEltsUFM deserialized
-
-  return $ map dataReprAnnToDataRepr' reprs
-
+-- | Find synthesize annotations and make sure each binder has no more than
+-- a single annotation.
 findSynthesizeAnnotations
   :: GHC.GhcMonad m
   => [CoreSyn.CoreBndr]
-  -> m [(CoreSyn.CoreBndr,Maybe TopEntity)]
+  -> m [(CoreSyn.CoreBndr, TopEntity)]
 findSynthesizeAnnotations bndrs = do
-  let deserializer = GhcPlugins.deserializeWithData :: ([Word8] -> TopEntity)
-      targets      = map (Annotations.NamedTarget . Var.varName) bndrs
+  anns <- findNamedAnnotations bndrs
+  pure (errOnDuplicateAnnotations "Synthesize" bndrs (map (filter isSyn) anns))
+ where
+  isSyn (Synthesize {}) = True
+  isSyn _               = False
 
-  anns <- mapM (GHC.findGlobalAnns deserializer) targets
-  let isSyn (Synthesize {}) = True
-      isSyn _               = False
-      anns'    = map (filter isSyn) anns
-      annBndrs = filter (not . null . snd) (zip bndrs anns')
-  case filter ((> 1) . length . snd) annBndrs of
-    [] -> return $ map (second listToMaybe) annBndrs
-    as -> Panic.pgmError $
-            "The following functions have multiple 'Synthesize' annotations: " ++
-            Outputable.showSDocUnsafe (ppr (map fst as))
-
+-- | Find testbench annotations and make sure that each binder has no more than
+-- a single annotation.
 findTestBenchAnnotations
   :: GHC.GhcMonad m
   => [CoreSyn.CoreBndr]
   -> m [(CoreSyn.CoreBndr,CoreSyn.CoreBndr)]
 findTestBenchAnnotations bndrs = do
-  let deserializer = GhcPlugins.deserializeWithData :: ([Word8] -> TopEntity)
-      targets      = map (Annotations.NamedTarget . Var.varName) bndrs
-
-  anns <- mapM (GHC.findGlobalAnns deserializer) targets
-  let isTB (TestBench {}) = True
-      isTB _              = False
-      anns'     = map (filter isTB) anns
-      annBndrs  = filter (not . null . snd) (zip bndrs anns')
-      annBndrs' = case filter ((> 1) . length . snd) annBndrs of
-        [] -> map (second head) annBndrs
-        as -> Panic.pgmError $
-          "The following functions have multiple 'TestBench' annotations: " ++
-          Outputable.showSDocUnsafe (ppr (map fst as))
-  return (map (second findTB) annBndrs')
+  anns0 <- findNamedAnnotations bndrs
+  let anns1 = map (filter isTB) anns0
+      anns2 = errOnDuplicateAnnotations "TestBench" bndrs anns1
+  return (map (second findTB) anns2)
   where
+    isTB (TestBench {}) = True
+    isTB _              = False
+
     findTB :: TopEntity -> CoreSyn.CoreBndr
     findTB (TestBench tb) = case listToMaybe (filter (eqNm tb) bndrs) of
       Just tb' -> tb'
@@ -414,34 +462,36 @@ findTestBenchAnnotations bndrs = do
         "TestBench named: " ++ show tb ++ " not found"
     findTB _ = Panic.pgmError "Unexpected Synthesize"
 
-    eqNm thNm bndr = show thNm == qualNm
+    eqNm thNm bndr = Text.pack (show thNm) == qualNm
       where
         bndrNm  = Var.varName bndr
-        qualNm  = maybe occName (\modName -> modName ++ ('.':occName)) (modNameM bndrNm)
-        occName = OccName.occNameString (Name.nameOccName bndrNm)
+        qualNm  = maybe occName (\modName -> modName `Text.append` ('.' `Text.cons` occName)) (modNameM bndrNm)
+        occName = Text.pack (OccName.occNameString (Name.nameOccName bndrNm))
 
+-- | Find primitive annotations bound to given binders, or annotations made
+-- in modules of those binders.
 findPrimitiveAnnotations
   :: GHC.GhcMonad m
   => HDL
+  -> FilePath
   -> [CoreSyn.CoreBndr]
   -> m [FilePath]
-findPrimitiveAnnotations hdl bndrs = do
-  dflags <- GHC.getSessionDynFlags
+findPrimitiveAnnotations hdl tmpDir bndrs = do
+  let
+    annTargets =
+     map
+       (fmap Annotations.ModuleTarget . Name.nameModule_maybe)
+       (map Var.varName bndrs)
 
-  let -- Using the stub directory as the output directory for inline primitives
-      outDir = fromMaybe "." $ GHC.stubDir dflags
-      deserializer = GhcPlugins.deserializeWithData :: ([Word8] -> Primitive)
-      targets =
-        concatMap
-          ( (\v -> catMaybes
-            [ Just $ Annotations.NamedTarget v
-            , Annotations.ModuleTarget <$> Name.nameModule_maybe v
-            ]) . Var.varName
-          ) bndrs
+  let
+    targets =
+      (catMaybes annTargets) ++
+        (map (Annotations.NamedTarget . Var.varName) bndrs)
 
-  anns <- mapM (GHC.findGlobalAnns deserializer) targets
+  anns <- findAnnotationsByTargets targets
+
   sequence $
-    mapMaybe (primitiveFilePath hdl outDir)
+    mapMaybe (primitiveFilePath hdl tmpDir)
     (concat $ zipWith (\t -> map ((,) t)) targets anns)
 
 parseModule :: GHC.GhcMonad m => GHC.ModSummary -> m GHC.ParsedModule
@@ -458,11 +508,7 @@ disableOptimizationsFlags ms@(GHC.ModSummary {..})
   where
     dflags = wantedOptimizationFlags (ms_hspp_opts
               { DynFlags.optLevel = 2
-#if __GLASGOW_HASKELL__ >= 711
               , DynFlags.reductionDepth = 1000
-#else
-              , DynFlags.ctxtStkDepth = 1000
-#endif
               })
 
 wantedOptimizationFlags :: GHC.DynFlags -> GHC.DynFlags
@@ -544,6 +590,42 @@ wantedOptimizationFlags df =
 -- properly. At the moment, Clash cannot deal with this recursive type and the
 -- recursive functions involved, and hence we need to disable this useful transformation. After
 -- everything is done properly, we should enable it again.
+
+
+wantedLanguageExtensions :: GHC.DynFlags -> GHC.DynFlags
+wantedLanguageExtensions df =
+    foldl' DynFlags.xopt_unset
+      (foldl' DynFlags.xopt_set df wanted) unwanted
+  where
+    -- Also update @Test.Tasty.Clash.outputTest'@ when updating this list!
+    wanted = [ LangExt.BinaryLiterals
+             , LangExt.ConstraintKinds
+             , LangExt.DataKinds
+             , LangExt.DeriveAnyClass
+             , LangExt.DeriveGeneric
+             , LangExt.DeriveLift
+             , LangExt.ExplicitForAll
+             , LangExt.ExplicitNamespaces
+             , LangExt.FlexibleContexts
+             , LangExt.KindSignatures
+             , LangExt.MagicHash
+             , LangExt.MonoLocalBinds
+             , LangExt.QuasiQuotes
+             , LangExt.ScopedTypeVariables
+             , LangExt.TemplateHaskell
+             , LangExt.TemplateHaskellQuotes
+             , LangExt.TypeApplications
+             , LangExt.TypeFamilies
+             , LangExt.TypeOperators
+             ]
+    unwanted = [ LangExt.ImplicitPrelude
+               , LangExt.MonomorphismRestriction
+#if MIN_VERSION_ghc(8,6,0)
+               , LangExt.StarIsType
+#endif
+               , LangExt.Strict
+               , LangExt.StrictData
+               ]
 
 -- | Remove all strictness annotations:
 --

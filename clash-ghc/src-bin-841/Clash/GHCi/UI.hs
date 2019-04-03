@@ -1911,11 +1911,12 @@ runExceptGhcMonad act = handleSourceError GHC.printException $
 exceptT :: Applicative m => Either e a -> ExceptT e m a
 exceptT = ExceptT . pure
 
-makeHDL' :: Clash.Backend.Backend backend
-         => (Int -> HdlSyn -> backend)
-         -> IORef ClashOpts
-         -> [FilePath]
-         -> InputT GHCi ()
+makeHDL'
+  :: Clash.Backend.Backend backend
+  => (Int -> HdlSyn -> Bool -> backend)
+  -> IORef ClashOpts
+  -> [FilePath]
+  -> InputT GHCi ()
 makeHDL' backend opts lst = makeHDL backend opts =<< case lst of
   srcs@(_:_) -> return srcs
   []         -> do
@@ -1925,20 +1926,25 @@ makeHDL' backend opts lst = makeHDL backend opts =<< case lst of
       ((AcyclicSCC top) : _) -> maybeToList $ (GHC.ml_hs_file . GHC.ms_location) top
       _                      -> []
 
-makeHDL :: GHC.GhcMonad m
-        => Clash.Backend.Backend backend
-        => (Int -> HdlSyn -> backend)
-        -> IORef ClashOpts
-        -> [FilePath]
-        -> m ()
+makeHDL
+  :: GHC.GhcMonad m
+  => Clash.Backend.Backend backend
+  => (Int -> HdlSyn -> Bool -> backend)
+  -> IORef ClashOpts
+  -> [FilePath]
+  -> m ()
 makeHDL backend optsRef srcs = do
   dflags <- GHC.getSessionDynFlags
   liftIO $ do startTime <- Clock.getCurrentTime
-              opts  <- readIORef optsRef
-              let iw  = opt_intWidth opts
-                  fp  = opt_floatSupport opts
-                  syn = opt_hdlSyn opts
-                  hdl = Clash.Backend.hdlKind backend'
+              opts0 <- readIORef optsRef
+              let opts1  = opts0 { opt_color = useColor dflags }
+                  iw     = opt_intWidth opts1
+                  fp     = opt_floatSupport opts1
+                  syn    = opt_hdlSyn opts1
+                  color  = opt_color opts1
+                  tmpDir = opt_tmpDir opts1
+                  esc    = opt_escapedIds opts1
+                  hdl    = Clash.Backend.hdlKind backend'
                   -- determine whether `-outputdir` was used
                   outputDir = do odir <- objectDir dflags
                                  hidir <- hiDir dflags
@@ -1948,26 +1954,27 @@ makeHDL backend optsRef srcs = do
                                     then Just odir
                                     else Nothing
                   idirs = importPaths dflags
-                  opts' = opts {opt_hdlDir = maybe outputDir Just (opt_hdlDir opts)
-                               ,opt_importPaths = idirs}
-                  backend' = backend iw syn
+                  opts2 = opts1 { opt_hdlDir = maybe outputDir Just (opt_hdlDir opts1)
+                                , opt_importPaths = idirs}
+                  backend' = backend iw syn esc
 
               primDirs <- Clash.Backend.primDirs backend'
 
               forM_ srcs $ \src -> do
                 -- Generate bindings:
                 (bindingsMap,tcm,tupTcm,topEntities,primMap,reprs) <-
-                  generateBindings primDirs idirs hdl src (Just dflags)
+                  generateBindings tmpDir color primDirs idirs hdl src (Just dflags)
                 prepTime <- startTime `deepseq` bindingsMap `deepseq` tcm `deepseq` Clock.getCurrentTime
                 let prepStartDiff = Clock.diffUTCTime prepTime startTime
-                putStrLn $ "Loading dependencies took " ++ show prepStartDiff
+                putStrLn $ "GHC+Clash: Loading modules cumulatively took " ++ show prepStartDiff
 
                 -- Parsing / compiling primitives:
                 startTime' <- Clock.getCurrentTime
-                primMap'   <- sequence $ HM.map Clash.Driver.compilePrimitive primMap
+                let dbs = reverse [p | PackageDB (PkgConfFile p) <- packageDBFlags dflags]
+                primMap'   <- sequence $ HM.map (sequence . fmap (Clash.Driver.compilePrimitive idirs dbs (topDir dflags))) primMap
                 prepTime'  <- startTime' `deepseq` primMap' `seq` Clock.getCurrentTime
                 let prepStartDiff' = Clock.diffUTCTime prepTime' startTime'
-                putStrLn $ "Parsing and compiling primitives took " ++ show prepStartDiff'
+                putStrLn $ "Clash: Parsing and compiling primitives took " ++ show prepStartDiff'
 
                 -- Generate HDL:
                 Clash.Driver.generateHDL
@@ -1980,17 +1987,17 @@ makeHDL backend optsRef srcs = do
                   (ghcTypeToHWType iw fp)
                   reduceConstant
                   topEntities
-                  opts'
+                  opts2
                   (startTime,prepTime)
 
 makeVHDL :: IORef ClashOpts -> [FilePath] -> InputT GHCi ()
-makeVHDL = makeHDL' (Clash.Backend.initBackend :: Int -> HdlSyn -> VHDLState)
+makeVHDL = makeHDL' (Clash.Backend.initBackend :: Int -> HdlSyn -> Bool -> VHDLState)
 
 makeVerilog :: IORef ClashOpts -> [FilePath] -> InputT GHCi ()
-makeVerilog = makeHDL' (Clash.Backend.initBackend :: Int -> HdlSyn -> VerilogState)
+makeVerilog = makeHDL' (Clash.Backend.initBackend :: Int -> HdlSyn -> Bool -> VerilogState)
 
 makeSystemVerilog :: IORef ClashOpts -> [FilePath] -> InputT GHCi ()
-makeSystemVerilog = makeHDL' (Clash.Backend.initBackend :: Int -> HdlSyn -> SystemVerilogState)
+makeSystemVerilog = makeHDL' (Clash.Backend.initBackend :: Int -> HdlSyn -> Bool -> SystemVerilogState)
 
 -----------------------------------------------------------------------------
 -- | @:type@ command. See also Note [TcRnExprMode] in TcRnDriver.

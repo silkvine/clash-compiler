@@ -1,6 +1,7 @@
 {-|
   Copyright  :  (C) 2012-2016, University of Twente,
-                    2017     , Myrtle Software Ltd, Google Inc.
+                    2017     , Myrtle Software Ltd,
+                    2017-2018, Google Inc.
   License    :  BSD2 (see the file LICENSE)
   Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 
@@ -27,28 +28,30 @@ module Clash.Netlist.Types
 where
 
 import Control.DeepSeq
+import Control.Monad.Fail                   (MonadFail)
 import Control.Monad.State                  (State)
 import Control.Monad.State.Strict           (MonadIO, MonadState, StateT)
 import Data.Bits                            (testBit)
+import Data.Binary                          (Binary(..))
 import Data.Hashable
-import Data.HashMap.Lazy                    (HashMap)
-import Data.IntMap.Lazy                     (IntMap, empty)
-import qualified Data.Text                  as S
-import Data.Text.Lazy                       (Text, pack)
+import Data.HashMap.Strict                  (HashMap)
+import Data.IntMap                          (IntMap, empty)
+import qualified Data.Set                   as Set
+import Data.Text                            (Text, pack)
 import Data.Typeable                        (Typeable)
 import Data.Text.Prettyprint.Doc.Extra      (Doc)
 import GHC.Generics                         (Generic)
 import Language.Haskell.TH.Syntax           (Lift)
-import Unbound.Generics.LocallyNameless     (Fresh, FreshMT)
 
 import SrcLoc                               (SrcSpan)
 
 import Clash.Annotations.TopEntity          (TopEntity)
 import Clash.Backend                        (Backend)
-import Clash.Core.Term                      (TmOccName)
 import Clash.Core.Type                      (Type)
-import Clash.Core.TyCon                     (TyCon, TyConOccName)
-import Clash.Driver.Types                   (BindingMap)
+import Clash.Core.Var                       (Attr')
+import Clash.Core.TyCon                     (TyConMap)
+import Clash.Core.VarEnv                    (VarEnv, InScopeSet)
+import Clash.Driver.Types                   (BindingMap, ClashOpts)
 import Clash.Netlist.BlackBox.Types         (BlackBoxTemplate)
 import Clash.Netlist.Id                     (IdType)
 import Clash.Primitives.Types               (CompiledPrimMap)
@@ -61,33 +64,47 @@ import Clash.Annotations.BitRepresentation.Internal
 -- | Monad that caches generated components (StateT) and remembers hidden inputs
 -- of components that are being generated (WriterT)
 newtype NetlistMonad a =
-  NetlistMonad { runNetlist :: StateT NetlistState (FreshMT IO) a }
-  deriving newtype (Functor, Monad, Applicative, MonadState NetlistState, Fresh, MonadIO)
+  NetlistMonad { runNetlist :: StateT NetlistState IO a }
+  deriving newtype (Functor, Monad, Applicative, MonadState NetlistState, MonadIO, MonadFail)
 
 -- | State of the NetlistMonad
 data NetlistState
   = NetlistState
-  { _bindings       :: BindingMap -- ^ Global binders
-  , _varCount       :: !Int -- ^ Number of signal declarations
-  , _components     :: HashMap TmOccName (SrcSpan,[Identifier],Component) -- ^ Cached components
-  , _primitives     :: CompiledPrimMap -- ^ Primitive Definitions
-  , _typeTranslator :: CustomReprs -> HashMap TyConOccName TyCon -> Bool -> Type -> Maybe (Either String HWType)
+  { _bindings       :: BindingMap
+  -- ^ Global binders
+  , _varCount       :: !Int
+  -- ^ Number of signal declarations
+  , _components     :: VarEnv ([Bool],SrcSpan,HashMap Identifier Word,Component)
+  -- ^ Cached components
+  , _primitives     :: CompiledPrimMap
+  -- ^ Primitive Definitions
+  , _typeTranslator :: CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType)
   -- ^ Hardcoded Type -> HWType translator
-  , _tcCache        :: HashMap TyConOccName TyCon -- ^ TyCon cache
+  , _tcCache        :: TyConMap
+  -- ^ TyCon cache
   , _curCompNm      :: !(Identifier,SrcSpan)
   , _intWidth       :: Int
   , _mkIdentifierFn :: IdType -> Identifier -> Identifier
   , _extendIdentifierFn :: IdType -> Identifier -> Identifier -> Identifier
-  , _seenIds        :: [Identifier]
-  , _seenComps      :: [Identifier]
-  , _componentNames :: HashMap TmOccName Identifier
-  , _topEntityAnns  :: HashMap TmOccName (Type, Maybe TopEntity)
+  , _seenIds        :: HashMap Identifier Word
+  , _seenComps      :: HashMap Identifier Word
+  , _seenPrimitives :: Set.Set Text
+  -- ^ Keeps track of invocations of ´mkPrimitive´. It is currently used to
+  -- filter duplicate warning invocations for dubious blackbox instantiations,
+  -- see GitHub pull request #286.
+  , _componentNames :: VarEnv Identifier
+  , _topEntityAnns  :: VarEnv (Type, Maybe TopEntity)
   , _hdlDir         :: FilePath
   , _curBBlvl       :: Int
   -- ^ The current scoping level assigned to black box contexts
   , _componentPrefix :: (Maybe Identifier,Maybe Identifier)
   -- ^ Prefix for top-level components, and prefix for all other components
   , _customReprs    :: CustomReprs
+  , _globalInScope  :: InScopeSet
+  , _clashOpts      :: ClashOpts
+  -- ^ Settings Clash was called with
+  , _isTestBench    :: Bool
+  -- ^ Whether we're compiling a testbench (suppresses some warnings)
   }
 
 -- | Signal reference
@@ -111,6 +128,15 @@ instance NFData Component where
 -- | Size indication of a type (e.g. bit-size or number of elements)
 type Size = Int
 
+type IsVoid = Bool
+
+-- | Tree structure indicating which constructor fields were filtered from
+-- a type due to them being void. We need this information to generate stable
+-- and/or user-defined port mappings.
+data FilteredHWType =
+  FilteredHWType HWType [[(IsVoid, FilteredHWType)]]
+    deriving (Eq, Show)
+
 -- | Representable hardware types
 data HWType
   = Void (Maybe HWType)
@@ -119,6 +145,8 @@ data HWType
   -- that vector.
   | String
   -- ^ String type
+  | Integer
+  -- ^ Integer type (for parameters only)
   | Bool
   -- ^ Boolean type
   | Bit
@@ -137,8 +165,9 @@ data HWType
   -- ^ RTree type
   | Sum           !Identifier [Identifier]
   -- ^ Sum type: Name and Constructor names
-  | Product       !Identifier [HWType]
-  -- ^ Product type: Name and field types
+  | Product       !Identifier (Maybe [Text]) [HWType]
+  -- ^ Product type: Name, field names, and field types. Field names will be
+  -- populated when using records.
   | SP            !Identifier [(Identifier,[HWType])]
   -- ^ Sum-of-Product type: Name and Constructor names + field types
   | Clock         !Identifier !Integer !ClockKind
@@ -153,6 +182,8 @@ data HWType
   | CustomSum !Identifier !DataRepr' !Size [(ConstrRepr', Identifier)]
   -- ^ Same as Sum, but with a user specified bit representation. For more info,
   -- see: Clash.Annotations.BitRepresentations.
+  | Annotated [Attr'] !HWType
+  -- ^ Annotated
   deriving (Eq,Ord,Show,Generic)
 
 instance Hashable ClockKind
@@ -160,6 +191,12 @@ instance Hashable ResetKind
 
 instance Hashable HWType
 instance NFData HWType
+
+-- | Extract hardware attributes from Annotated. Returns an empty list if
+-- non-Annotated given or if Annotated has an empty list of attributes.
+hwTypeAttrs :: HWType -> [Attr']
+hwTypeAttrs (Annotated attrs _type) = attrs
+hwTypeAttrs _                       = []
 
 -- | Internals of a Component
 data Declaration
@@ -181,24 +218,40 @@ data Declaration
   -- * Type of the scrutinee
   --
   -- * List of: (Maybe expression scrutinized expression is compared with,RHS of alternative)
-  | InstDecl EntityOrComponent (Maybe Identifier) !Identifier !Identifier [(Expr,PortDirection,HWType,Expr)]
-  -- ^ Instantiation of another component
+  | InstDecl EntityOrComponent (Maybe Identifier) !Identifier !Identifier [(Expr,HWType,Expr)] [(Expr,PortDirection,HWType,Expr)]
+  -- ^ Instantiation of another component:
+  --
+  -- * Whether it's an entity or a component
+  --
+  -- * Comment to add to the generated code
+  --
+  -- * The component's (or entity's) name
+  --
+  -- * Instance label
+  --
+  -- * List of parameters for this component (param name, param type, param value)
+  --
+  -- * Ports (port name, port direction, type, assignment)
   | BlackBoxD
       -- Primitive name:
-      !S.Text
+      !Text
       -- VHDL only: add /library/ declarations:
       [BlackBoxTemplate]
       -- VHDL only: add /use/ declarations:
       [BlackBoxTemplate]
       -- Intel/Quartus only: create a /.qsys/ file from given template:
-      [((S.Text,S.Text),BlackBox)]
+      [((Text,Text),BlackBox)]
       -- Template tokens:
       !BlackBox
       -- Context in which tokens should be rendered:
       BlackBoxContext
   -- ^ Instantiation of blackbox declaration
-  | NetDecl' (Maybe Identifier) WireOrReg !Identifier (Either Identifier HWType)
-  -- ^ Signal declaration
+  | NetDecl'
+      (Maybe Identifier)         -- Note; will be inserted as a comment in target hdl
+      WireOrReg                  -- Wire or register
+      !Identifier                -- Name of signal
+      (Either Identifier HWType) -- Pointer to type of signal or type of signal
+      -- ^ Signal declaration
   deriving Show
 
 data EntityOrComponent = Entity | Comp
@@ -209,7 +262,14 @@ data WireOrReg = Wire | Reg
 
 instance NFData WireOrReg
 
-pattern NetDecl :: Maybe Identifier -> Identifier -> HWType -> Declaration
+pattern NetDecl
+  :: Maybe Identifier
+  -- ^ Note; will be inserted as a comment in target hdl
+  -> Identifier
+  -- ^ Name of signal
+  -> HWType
+  -- ^ Type of signal
+  -> Declaration
 pattern NetDecl note d ty <- NetDecl' note Wire d (Right ty)
   where
     NetDecl note d ty = NetDecl' note Wire d (Right ty)
@@ -226,6 +286,8 @@ data Modifier
   | DC (HWType,Int) -- ^ See expression in a DataCon context: (Type of the expression, DataCon tag)
   | VecAppend -- ^ See the expression in the context of a Vector append operation
   | RTreeAppend -- ^ See the expression in the context of a Tree append operation
+  | Sliced (HWType,Int,Int)
+  -- ^ Slice the identifier of the given type from start to end
   | Nested Modifier Modifier
   deriving Show
 
@@ -237,13 +299,13 @@ data Expr
   | DataTag    !HWType       !(Either Identifier Identifier) -- ^ @Left e@: tagToEnum#, @Right e@: dataToTag#
   | BlackBoxE
       -- Primitive name:
-      !S.Text
+      !Text
       -- VHDL only: add /library/ declarations:
       [BlackBoxTemplate]
       -- VHDL only: add /use/ declarations:
       [BlackBoxTemplate]
       -- Intel/Quartus only: create a /.qsys/ file from given template.
-      [((S.Text,S.Text),BlackBox)]
+      [((Text,Text),BlackBox)]
       -- Template tokens:
       !BlackBox
       -- Context in which tokens should be rendered:
@@ -289,7 +351,7 @@ data BlackBoxContext
                           ,WireOrReg
                           ,[BlackBoxTemplate]
                           ,[BlackBoxTemplate]
-                          ,[((S.Text,S.Text),BlackBox)]
+                          ,[((Text,Text),BlackBox)]
                           ,BlackBoxContext)
   -- ^ Function arguments (subset of inputs):
   --
@@ -307,9 +369,13 @@ data BlackBoxContext
   }
   deriving Show
 
+type BBName = String
+type BBHash = Int
+
 data BlackBox
   = BBTemplate BlackBoxTemplate
-  | BBFunction TemplateFunction
+  | BBFunction BBName BBHash TemplateFunction
+  deriving (Generic, NFData, Binary)
 
 data TemplateFunction where
   TemplateFunction
@@ -320,7 +386,17 @@ data TemplateFunction where
 
 instance Show BlackBox where
   show (BBTemplate t)  = show t
-  show (BBFunction {}) = "TemplateFunction"
+  show (BBFunction nm hsh _) =
+    "<TemplateFunction(nm=" ++ show nm ++ ", hash=" ++ show hsh ++ ")>"
+
+instance NFData TemplateFunction where
+  rnf (TemplateFunction is f _) = rnf is `seq` f `seq` ()
+
+-- | __NB__: serialisation doesn't preserve the embedded function
+instance Binary TemplateFunction where
+  put (TemplateFunction is _ _ ) = put is
+  get = (\is -> TemplateFunction is err err) <$> get
+    where err = const $ error "TemplateFunction functions can't be preserved by serialisation"
 
 emptyBBContext :: BlackBoxContext
 emptyBBContext

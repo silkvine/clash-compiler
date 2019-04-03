@@ -20,7 +20,7 @@ normalization = rmDeadcode >-> constantPropgation >-> etaTL >-> rmUnusedExpr >-!
                 bindConst >-> letTL >-> evalConst >-!-> cse >-!-> cleanup >-> recLetRec
   where
     etaTL      = apply "etaTL" etaExpansionTL !-> innerMost (apply "applicationPropagation" appProp)
-    anf        = topdownR (apply "nonRepANF" nonRepANF) >-> apply "ANF" makeANF
+    anf        = topdownR (apply "nonRepANF" nonRepANF) >-> apply "ANF" makeANF >-> topdownR (apply "caseCon" caseCon)
     letTL      = topdownSucR (apply "topLet" topLet)
     recLetRec  = apply "recToLetRec" recToLetRec
     rmUnusedExpr = bottomupR (apply "removeUnusedExpr" removeUnusedExpr)
@@ -28,7 +28,8 @@ normalization = rmDeadcode >-> constantPropgation >-> etaTL >-> rmUnusedExpr >-!
     bindConst  = topdownR (apply "bindConstantVar" bindConstantVar)
     evalConst  = topdownR (apply "evalConst" reduceConst)
     cse        = topdownR (apply "CSE" simpleCSE)
-    cleanup    = topdownSucR (apply "inlineCleanup" inlineCleanup) !->
+    cleanup    = topdownR (apply "etaExpandSyn" etaExpandSyn) >->
+                 topdownSucR (apply "inlineCleanup" inlineCleanup) !->
                  innerMost (applyMany [("caseCon"        , caseCon)
                                       ,("bindConstantVar", bindConstantVar)
                                       ,("letFlat"        , flattenLet)])
@@ -50,11 +51,14 @@ constantPropgation = propagate >-> repeatR inlineAndPropagate >->
 
     transPropagate :: [(String,NormRewrite)]
     transPropagate =
-      [ ("applicationPropagation", appProp        )
-      , ("bindConstantVar"       , bindConstantVar)
-      , ("caseLet"               , caseLet        )
-      , ("caseCase"              , caseCase       )
-      , ("caseCon"               , caseCon        )
+      [ ("applicationPropagation", appProp              )
+      , ("bindConstantVar"       , bindConstantVar      )
+      , ("caseLet"               , caseLet              )
+      , ("caseCase"              , caseCase             )
+      , ("caseCon"               , caseCon              )
+      , ("caseElemNonReachable"  , caseElemNonReachable )
+      , ("elemExistentials"      , elemExistentials     )
+      , ("removeUnusedExpr"      , removeUnusedExpr     )
       ]
 
     -- These transformations can safely be applied in a top-down traversal as
@@ -222,7 +226,7 @@ liftNonRep.
 
 -- | Topdown traversal, stops upon first success
 topdownSucR :: Rewrite extra -> Rewrite extra
-topdownSucR r = r >-! (allR True (topdownSucR r))
+topdownSucR r = r >-! (allR (topdownSucR r))
 
 innerMost :: Rewrite extra -> Rewrite extra
 innerMost r = bottomupR (r !-> innerMost r)

@@ -12,18 +12,21 @@ module Clash.Netlist
   ,mkNetDecl
   ,mkProjection
   ,mkSelection
+  ,mkFunApp
   ) where
 
+import Data.HashMap.Strict  (HashMap)
 import Clash.Core.DataCon   (DataCon)
-import Clash.Core.Term      (Alt,LetBinding,Term,TmOccName)
+import Clash.Core.Term      (Alt,LetBinding,Term)
 import Clash.Core.Type      (Type)
 import Clash.Core.Var       (Id)
-import Clash.Driver.Types   (SrcSpan)
 import Clash.Netlist.Types  (Expr, HWType, Identifier, NetlistMonad, Component,
                              Declaration)
+import SrcLoc               (SrcSpan)
 
-genComponent :: TmOccName
-             -> NetlistMonad (SrcSpan,[Identifier],Component)
+
+genComponent :: Id
+             -> NetlistMonad ([Bool],SrcSpan,HashMap Identifier Word,Component)
 
 mkExpr :: Bool
        -> Either Identifier Id
@@ -55,3 +58,9 @@ mkSelection
 mkNetDecl :: LetBinding -> NetlistMonad (Maybe Declaration)
 
 mkDeclarations :: Id -> Term -> NetlistMonad [Declaration]
+
+mkFunApp
+  :: Identifier -- ^ LHS of the let-binder
+  -> Id -- ^ Name of the applied function
+  -> [Term] -- ^ Function arguments
+  -> NetlistMonad [Declaration]

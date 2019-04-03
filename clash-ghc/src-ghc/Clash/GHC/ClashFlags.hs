@@ -6,6 +6,7 @@
 -}
 
 {-# LANGUAGE CPP           #-}
+{-# LANGUAGE LambdaCase    #-}
 {-# LANGUAGE TupleSections #-}
 
 module Clash.GHC.ClashFlags
@@ -58,8 +59,11 @@ flagsClash r = [
     defFlag "fclash-debug"                   $ SepArg (setDebugLevel r)
   , defFlag "fclash-hdldir"                  $ SepArg (setHdlDir r)
   , defFlag "fclash-hdlsyn"                  $ SepArg (setHdlSyn r)
-  , defFlag "fclash-nocache"                 $ NoArg (liftEwM (setNoCache r))
-  , defFlag "fclash-noclean"                 $ NoArg (liftEwM (setNoClean r))
+  , defFlag "fclash-nocache"                 $ NoArg (deprecated "nocache" "no-cache" setNoCache r)
+  , defFlag "fclash-no-cache"                $ NoArg (liftEwM (setNoCache r))
+  , defFlag "fclash-noclean"                 $ NoArg (deprecated "noclean" "no-clean" setNoClean r)
+  , defFlag "fclash-no-clean"                $ NoArg (liftEwM (setNoClean r))
+  , defFlag "fclash-no-prim-warn"            $ NoArg (liftEwM (setNoPrimWarn r))
   , defFlag "fclash-spec-limit"              $ IntSuffix (liftEwM . setSpecLimit r)
   , defFlag "fclash-inline-limit"            $ IntSuffix (liftEwM . setInlineLimit r)
   , defFlag "fclash-inline-function-limit"   $ IntSuffix (liftEwM . setInlineFunctionLimit r)
@@ -69,7 +73,25 @@ flagsClash r = [
   , defFlag "fclash-float-support"           $ NoArg (liftEwM (setFloatSupport r))
   , defFlag "fclash-allow-zero-width"        $ NoArg (setAllowZeroWidth r)
   , defFlag "fclash-component-prefix"        $ SepArg (liftEwM . setComponentPrefix r)
+  , defFlag "fclash-old-inline-strategy"     $ NoArg (liftEwM (setOldInlineStrategy r))
+  , defFlag "fclash-no-escaped-identifiers"  $ NoArg (liftEwM (setNoEscapedIds r))
   ]
+
+-- | Print deprecated flag warning
+deprecated
+  :: String
+  -- ^ Deprecated flag
+  -> String
+  -- ^ Use X instead
+  -> (a -> IO ())
+  -> a
+  -> EwM IO ()
+deprecated wrong right f a = do
+  addWarn ("Using '-fclash-" ++ wrong
+                             ++ "' is deprecated. Use '-fclash-"
+                             ++ right
+                             ++ "' instead.")
+  liftEwM (f a)
 
 setInlineLimit :: IORef ClashOpts
                -> Int
@@ -97,7 +119,9 @@ setDebugLevel :: IORef ClashOpts
               -> String
               -> EwM IO ()
 setDebugLevel r s = case readMaybe s of
-  Just dbgLvl -> liftEwM $ modifyIORef r (\c -> c {opt_dbgLevel = dbgLvl})
+  Just dbgLvl -> liftEwM $ do
+                   modifyIORef r (\c -> c {opt_dbgLevel = dbgLvl})
+                   when (dbgLvl > DebugNone) $ setNoCache r -- when debugging disable cache
   Nothing     -> addWarn (s ++ " is an invalid debug level")
 
 setNoCache :: IORef ClashOpts -> IO ()
@@ -105,6 +129,9 @@ setNoCache r = modifyIORef r (\c -> c {opt_cachehdl = False})
 
 setNoClean :: IORef ClashOpts -> IO ()
 setNoClean r = modifyIORef r (\c -> c {opt_cleanhdl = False})
+
+setNoPrimWarn :: IORef ClashOpts -> IO ()
+setNoPrimWarn r = modifyIORef r (\c -> c {opt_primWarn = False})
 
 setIntWidth :: IORef ClashOpts
             -> Int
@@ -124,9 +151,12 @@ setHdlSyn :: IORef ClashOpts
           -> EwM IO ()
 setHdlSyn r s = case readMaybe s of
   Just hdlSyn -> liftEwM $ modifyIORef r (\c -> c {opt_hdlSyn = hdlSyn})
-  Nothing     -> if s == "Xilinx"
-                    then liftEwM $ modifyIORef r (\c -> c {opt_hdlSyn = Vivado})
-                    else addWarn (s ++ " is an unknown hdl synthesis tool")
+  Nothing -> case s of
+    "Xilinx"  -> liftEwM $ modifyIORef r (\c -> c {opt_hdlSyn = Vivado})
+    "ISE"     -> liftEwM $ modifyIORef r (\c -> c {opt_hdlSyn = Vivado})
+    "Altera"  -> liftEwM $ modifyIORef r (\c -> c {opt_hdlSyn = Quartus})
+    "Intel"   -> liftEwM $ modifyIORef r (\c -> c {opt_hdlSyn = Quartus})
+    _         -> addWarn (s ++ " is an unknown hdl synthesis tool")
 
 setErrorExtra :: IORef ClashOpts -> IO ()
 setErrorExtra r = modifyIORef r (\c -> c {opt_errorExtra = True})
@@ -144,3 +174,9 @@ setComponentPrefix
   -> String
   -> IO ()
 setComponentPrefix r s = modifyIORef r (\c -> c {opt_componentPrefix = Just s})
+
+setOldInlineStrategy :: IORef ClashOpts -> IO ()
+setOldInlineStrategy r = modifyIORef r (\c -> c {opt_newInlineStrat = False})
+
+setNoEscapedIds :: IORef ClashOpts -> IO ()
+setNoEscapedIds r = modifyIORef r (\c -> c {opt_escapedIds = False})
