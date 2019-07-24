@@ -22,10 +22,10 @@ import           Control.Lens                     ((.=),(^.),_2)
 import qualified Control.Lens                     as Lens
 import           Control.Monad                    (join)
 import           Control.Monad.IO.Class           (liftIO)
-import           Control.Monad.State.Strict       (runStateT)
+import           Control.Monad.State.Strict       (State, runStateT)
 import           Data.Binary.IEEE754              (floatToWord, doubleToWord)
 import           Data.Char                        (ord)
-import           Data.Either                      (lefts,partitionEithers)
+import           Data.Either                      (partitionEithers)
 import           Data.HashMap.Strict              (HashMap)
 import qualified Data.HashMap.Strict              as HashMapS
 import qualified Data.HashMap.Lazy                as HashMap
@@ -53,16 +53,16 @@ import           Clash.Core.Literal               (Literal (..))
 import           Clash.Core.Name                  (Name(..))
 import           Clash.Core.Pretty                (showPpr)
 import           Clash.Core.Term
-  (Alt, Pat (..), Term (..))
+  (Alt, Pat (..), Term (..), collectArgs)
 import qualified Clash.Core.Term                  as Core
 import           Clash.Core.Type
   (Type (..), coreView1, splitFunTys, splitCoreFunForallTy)
 import           Clash.Core.TyCon                 (TyConMap)
-import           Clash.Core.Util                  (collectArgs, termType)
+import           Clash.Core.Util                  (mkApps, termType)
 import           Clash.Core.Var                   (Id, Var (..))
 import           Clash.Core.VarEnv
-  (InScopeSet, VarEnv, eltsVarEnv, emptyVarEnv, extendVarEnv, lookupVarEnv, lookupVarEnv',
-    mkVarEnv)
+  (VarEnv, eltsVarEnv, emptyInScopeSet, emptyVarEnv, extendVarEnv, lookupVarEnv,
+   lookupVarEnv', mkVarEnv)
 import           Clash.Driver.Types               (BindingMap, ClashOpts)
 import           Clash.Netlist.BlackBox
 import           Clash.Netlist.Id
@@ -83,15 +83,14 @@ genNetlist
   -- ^ Custom bit representations for certain types
   -> BindingMap
   -- ^ Global binders
-  -> InScopeSet
-  -- ^ Superset of global bindings
   -> [(Id,Maybe TopEntity,Maybe Id)]
   -- ^ All the TopEntities
   -> CompiledPrimMap
   -- ^ Primitive definitions
   -> TyConMap
   -- ^ TyCon cache
-  -> (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  -> (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -- ^ Hardcoded Type -> HWType translator
   -> Int
   -- ^ Int/Word/Integer bit-width
@@ -99,6 +98,8 @@ genNetlist
   -- ^ valid identifiers
   -> (IdType -> Identifier -> Identifier -> Identifier)
   -- ^ extend valid identifiers
+  -> Bool
+  -- ^ Whether the backend supports ifThenElse expressions
   -> HashMap Identifier Word
   -- ^ Seen components
   -> FilePath
@@ -108,9 +109,9 @@ genNetlist
   -> Id
   -- ^ Name of the @topEntity@
   -> IO ([([Bool],SrcSpan,HashMap Identifier Word,Component)],HashMap Identifier Word)
-genNetlist isTb opts reprs globals is0 tops primMap tcm typeTrans iw mkId extId seen env prefixM topEntity = do
-  (_,s) <- runNetlistMonad isTb opts reprs globals is0 (mkTopEntityMap tops)
-             primMap tcm typeTrans iw mkId extId seen env prefixM $
+genNetlist isTb opts reprs globals tops primMap tcm typeTrans iw mkId extId ite seen env prefixM topEntity = do
+  (_,s) <- runNetlistMonad isTb opts reprs globals (mkTopEntityMap tops)
+             primMap tcm typeTrans iw mkId extId ite seen env prefixM $
              genComponent topEntity
   return ( eltsVarEnv $ _components s
          , _seenComps s
@@ -131,15 +132,14 @@ runNetlistMonad
   -- ^ Custom bit representations for certain types
   -> BindingMap
   -- ^ Global binders
-  -> InScopeSet
-  -- ^ Superset of global bindings
   -> VarEnv (Type, Maybe TopEntity)
   -- ^ TopEntity annotations
   -> CompiledPrimMap
   -- ^ Primitive Definitions
   -> TyConMap
   -- ^ TyCon cache
-  -> (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  -> (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -- ^ Hardcode Type -> HWType translator
   -> Int
   -- ^ Int/Word/Integer bit-width
@@ -147,6 +147,8 @@ runNetlistMonad
   -- ^ valid identifiers
   -> (IdType -> Identifier -> Identifier -> Identifier)
   -- ^ extend valid identifiers
+  -> Bool
+  -- ^ Whether the backend supports ifThenElse expressions
   -> HashMap Identifier Word
   -- ^ Seen components
   -> FilePath
@@ -156,14 +158,15 @@ runNetlistMonad
   -> NetlistMonad a
   -- ^ Action to run
   -> IO (a, NetlistState)
-runNetlistMonad isTb opts reprs s is0 tops p tcm typeTrans iw mkId extId seenIds_ env prefixM
+runNetlistMonad isTb opts reprs s tops p tcm typeTrans iw mkId extId ite seenIds_ env prefixM
   = flip runStateT s'
   . runNetlist
   where
     s' =
       NetlistState
         s 0 emptyVarEnv p typeTrans tcm (StrictText.empty,noSrcSpan) iw mkId
-        extId HashMapS.empty seenIds' Set.empty names tops env 0 prefixM reprs is0 opts isTb
+        extId HashMapS.empty seenIds' Set.empty names tops env 0 prefixM reprs opts isTb ite
+        HashMapS.empty
 
     (seenIds',names) = genNames mkId prefixM seenIds_ emptyVarEnv s
 
@@ -183,7 +186,8 @@ genNames mkId prefixM s0 m0 = foldl go (s0,m0)
 
 -- | Generate a component for a given function (caching)
 genComponent
-  :: Id
+  :: HasCallStack
+  => Id
   -- ^ Name of the function
   -> NetlistMonad ([Bool],SrcSpan,HashMap Identifier Word,Component)
 genComponent compName = do
@@ -197,7 +201,8 @@ genComponent compName = do
 
 -- | Generate a component for a given function
 genComponentT
-  :: Id
+  :: HasCallStack
+  => Id
   -- ^ Name of the function
   -> Term
   -- ^ Corresponding term
@@ -227,7 +232,7 @@ genComponentT compName componentExpr = do
     case splitNormalized tcm componentExpr of
       Right (args, binds, res) -> do
         let varType'   = fromMaybe (varType res) topEntityTypeM'
-        mkUniqueNormalized topEntMM ((args, binds, res{varType=varType'}))
+        mkUniqueNormalized emptyInScopeSet topEntMM ((args, binds, res{varType=varType'}))
       Left err ->
         throw (ClashException sp err Nothing)
 
@@ -272,7 +277,14 @@ mkNetDecl (id_,tm) = do
     nm = varName id_
 
     termToWireOrReg :: Term -> NetlistMonad WireOrReg
-    termToWireOrReg (Case _ _ (_:_:_)) = return Reg
+    termToWireOrReg (Case scrut _ alts0@(_:_:_)) = do
+      tcm <- Lens.use tcCache
+      let scrutTy = termType tcm scrut
+      scrutHTy <- unsafeCoreTypeToHWTypeM' $(curLoc) scrutTy
+      ite <- Lens.use backEndITE
+      case iteAlts scrutHTy alts0 of
+        Just _ | ite -> return Wire
+        _ -> return Reg
     termToWireOrReg (collectArgs -> (Prim nm' _,_)) = do
       bbM <- HashMap.lookup nm' <$> Lens.use primitives
       case bbM of
@@ -293,7 +305,8 @@ isWriteToBiSignalPrimitive e = case collectArgs e of
 -- | Generate a list of Declarations for a let-binder, return an empty list
 -- if the bound expression is represented by 0 bits
 mkDeclarations
-  :: Id
+  :: HasCallStack
+  => Id
   -- ^ LHS of the let-binder
   -> Term
   -- ^ RHS of the let-binder
@@ -306,7 +319,8 @@ mkDeclarations bndr e = do
 
 -- | Generate a list of Declarations for a let-binder
 mkDeclarations'
-  :: Id
+  :: HasCallStack
+  => Id
   -- ^ LHS of the let-binder
   -> Term
   -- ^ RHS of the let-binder
@@ -325,7 +339,7 @@ mkDeclarations' _ e@(Case _ _ []) = do
           Nothing
 
 mkDeclarations' bndr (Case scrut altTy alts@(_:_:_)) =
-  mkSelection bndr scrut altTy alts
+  mkSelection (Right bndr) scrut altTy alts
 
 mkDeclarations' bndr app =
   let (appF,(args,tyArgs)) = second partitionEithers $ collectArgs app
@@ -357,56 +371,69 @@ mkDeclarations' bndr app =
 -- | Generate a declaration that selects an alternative based on the value of
 -- the scrutinee
 mkSelection
-  :: Id
+  :: (Either Identifier Id)
   -> Term
   -> Type
   -> [Alt]
   -> NetlistMonad [Declaration]
-mkSelection bndr scrut altTy alts = do
-  tcm                    <- Lens.use tcCache
-  reprs                  <- Lens.use customReprs
-  let scrutTy            = termType tcm scrut
-      alts'              = (reorderDefault . reorderCustom tcm reprs scrutTy)
-                           alts
-  scrutHTy               <- unsafeCoreTypeToHWTypeM' $(curLoc) scrutTy
-  altHTy                 <- unsafeCoreTypeToHWTypeM' $(curLoc) altTy
-  scrutId                <- extendIdentifier Extended
-                               (id2identifier bndr)
-                               "_selection"
-  (_,sp)                 <- Lens.use curCompNm
-  (scrutExpr,scrutDecls) <- first (mkScrutExpr sp scrutHTy (fst (head alts'))) <$> mkExpr True (Left scrutId) scrutTy scrut
-  (exprs,altsDecls)      <- (second concat . unzip) <$> mapM (mkCondExpr scrutHTy) alts'
+mkSelection bndr scrut altTy alts0 = do
+  let dstId = either id id2identifier bndr
+  tcm <- Lens.use tcCache
+  let scrutTy = termType tcm scrut
+  scrutHTy <- unsafeCoreTypeToHWTypeM' $(curLoc) scrutTy
+  scrutId  <- extendIdentifier Extended dstId "_selection"
+  (_,sp) <- Lens.use curCompNm
+  ite <- Lens.use backEndITE
+  case iteAlts scrutHTy alts0 of
+    Just (altT,altF)
+      | ite
+      -> do
+      (scrutExpr,scrutDecls) <- case scrutHTy of
+        SP {} -> first (mkScrutExpr sp scrutHTy (fst (last alts0))) <$>
+                   mkExpr True (Left scrutId) scrutTy scrut
+        _ -> mkExpr False (Left scrutId) scrutTy scrut
+      altTId <- extendIdentifier Extended dstId "_sel_alt_t"
+      altFId <- extendIdentifier Extended dstId "_sel_alt_f"
+      (altTExpr,altTDecls) <- mkExpr False (Left altTId) altTy altT
+      (altFExpr,altFDecls) <- mkExpr False (Left altFId) altTy altF
+      return $! scrutDecls ++ altTDecls ++ altFDecls ++
+                [Assignment dstId (IfThenElse scrutExpr altTExpr altFExpr)]
+    _ -> do
+      reprs <- Lens.use customReprs
+      let alts1 = (reorderDefault . reorderCustom tcm reprs scrutTy) alts0
+      altHTy                 <- unsafeCoreTypeToHWTypeM' $(curLoc) altTy
+      (scrutExpr,scrutDecls) <- first (mkScrutExpr sp scrutHTy (fst (head alts1))) <$>
+                                  mkExpr True (Left scrutId) scrutTy scrut
+      (exprs,altsDecls)      <- (second concat . unzip) <$> mapM (mkCondExpr scrutHTy) alts1
+      return $! scrutDecls ++ altsDecls ++ [CondAssignment dstId altHTy scrutExpr scrutHTy exprs]
+ where
+  mkCondExpr :: HWType -> (Pat,Term) -> NetlistMonad ((Maybe HW.Literal,Expr),[Declaration])
+  mkCondExpr scrutHTy (pat,alt) = do
+    altId <- extendIdentifier Extended
+               (either id id2identifier bndr)
+               "_sel_alt"
+    (altExpr,altDecls) <- mkExpr False (Left altId) altTy alt
+    (,altDecls) <$> case pat of
+      DefaultPat           -> return (Nothing,altExpr)
+      DataPat dc _ _ -> return (Just (dcToLiteral scrutHTy (dcTag dc)),altExpr)
+      LitPat  (IntegerLiteral i) -> return (Just (NumLit i),altExpr)
+      LitPat  (IntLiteral i) -> return (Just (NumLit i), altExpr)
+      LitPat  (WordLiteral w) -> return (Just (NumLit w), altExpr)
+      LitPat  (CharLiteral c) -> return (Just (NumLit . toInteger $ ord c), altExpr)
+      LitPat  (Int64Literal i) -> return (Just (NumLit i), altExpr)
+      LitPat  (Word64Literal w) -> return (Just (NumLit w), altExpr)
+      LitPat  (NaturalLiteral n) -> return (Just (NumLit n), altExpr)
+      _  -> do
+        (_,sp) <- Lens.use curCompNm
+        throw (ClashException sp ($(curLoc) ++ "Not an integer literal in LitPat:\n\n" ++ showPpr pat) Nothing)
 
-  let dstId = id2identifier bndr
-  return $! scrutDecls ++ altsDecls ++ [CondAssignment dstId altHTy scrutExpr scrutHTy exprs]
-  where
-    mkCondExpr :: HWType -> (Pat,Term) -> NetlistMonad ((Maybe HW.Literal,Expr),[Declaration])
-    mkCondExpr scrutHTy (pat,alt) = do
-      altId <- extendIdentifier Extended
-                 (id2identifier bndr)
-                 "_sel_alt"
-      (altExpr,altDecls) <- mkExpr False (Left altId) altTy alt
-      (,altDecls) <$> case pat of
-        DefaultPat           -> return (Nothing,altExpr)
-        DataPat dc _ _ -> return (Just (dcToLiteral scrutHTy (dcTag dc)),altExpr)
-        LitPat  (IntegerLiteral i) -> return (Just (NumLit i),altExpr)
-        LitPat  (IntLiteral i) -> return (Just (NumLit i), altExpr)
-        LitPat  (WordLiteral w) -> return (Just (NumLit w), altExpr)
-        LitPat  (CharLiteral c) -> return (Just (NumLit . toInteger $ ord c), altExpr)
-        LitPat  (Int64Literal i) -> return (Just (NumLit i), altExpr)
-        LitPat  (Word64Literal w) -> return (Just (NumLit w), altExpr)
-        LitPat  (NaturalLiteral n) -> return (Just (NumLit n), altExpr)
-        _  -> do
-          (_,sp) <- Lens.use curCompNm
-          throw (ClashException sp ($(curLoc) ++ "Not an integer literal in LitPat:\n\n" ++ showPpr pat) Nothing)
-
-    mkScrutExpr :: SrcSpan -> HWType -> Pat -> Expr -> Expr
-    mkScrutExpr sp scrutHTy pat scrutE = case pat of
-      DataPat dc _ _ -> let modifier = Just (DC (scrutHTy,dcTag dc - 1))
-                        in case scrutE of
-                            Identifier scrutId Nothing -> Identifier scrutId modifier
-                            _ -> throw (ClashException sp ($(curLoc) ++ "Not in normal form: Not a variable reference or primitive as subject of a case-statement:\n\n" ++ show scrutE) Nothing)
-      _ -> scrutE
+  mkScrutExpr :: SrcSpan -> HWType -> Pat -> Expr -> Expr
+  mkScrutExpr sp scrutHTy pat scrutE = case pat of
+    DataPat dc _ _ -> let modifier = Just (DC (scrutHTy,dcTag dc - 1))
+                      in case scrutE of
+                          Identifier scrutId Nothing -> Identifier scrutId modifier
+                          _ -> throw (ClashException sp ($(curLoc) ++ "Not in normal form: Not a variable reference or primitive as subject of a case-statement:\n\n" ++ show scrutE) Nothing)
+    _ -> scrutE
 
 -- GHC puts default patterns in the first position, we want them in the
 -- last position.
@@ -452,7 +479,8 @@ patPos reprs pat@(DataPat dataCon _ _) =
 
 -- | Generate a list of Declarations for a let-binder where the RHS is a function application
 mkFunApp
-  :: Identifier -- ^ LHS of the let-binder
+  :: HasCallStack
+  => Identifier -- ^ LHS of the let-binder
   -> Id -- ^ Name of the applied function
   -> [Term] -- ^ Function arguments
   -> NetlistMonad [Declaration]
@@ -512,8 +540,9 @@ mkFunApp dstId fun args = do
                   outpAssign    = case compOutp of
                     Nothing -> []
                     Just (id_,hwtype) -> [(Identifier id_ Nothing,Out,hwtype,Identifier dstId Nothing)]
-              instLabel <- extendIdentifier Basic compName (StrictText.pack "_" `StrictText.append` dstId)
-              let instDecl      = InstDecl Entity Nothing compName instLabel [] (outpAssign ++ inpAssigns)
+              instLabel0 <- extendIdentifier Basic compName (StrictText.pack "_" `StrictText.append` dstId)
+              instLabel1 <- mkUniqueIdentifier Basic instLabel0
+              let instDecl      = InstDecl Entity Nothing compName instLabel1 [] (outpAssign ++ inpAssigns)
               return (argDecls ++ argDecls' ++ [instDecl])
             else error $ $(curLoc) ++ "under-applied normalized function"
         Nothing -> case args of
@@ -535,7 +564,8 @@ toSimpleVar dstId (e,ty) = do
   return (Identifier argNm' Nothing,[argDecl,argAssn])
 
 -- | Generate an expression for a term occurring on the RHS of a let-binder
-mkExpr :: Bool -- ^ Treat BlackBox expression as declaration
+mkExpr :: HasCallStack
+       => Bool -- ^ Treat BlackBox expression as declaration
        -> (Either Identifier Id) -- ^ Id to assign the result to
        -> Type -- ^ Type of the LHS of the let-binder
        -> Term -- ^ Term to convert to an expression
@@ -561,7 +591,7 @@ mkExpr _ _ _ (Core.Literal l) = do
 
 mkExpr bbEasD bndr ty app = do
   let (appF,args) = collectArgs app
-      tmArgs      = lefts args
+      (tmArgs,tyArgs) = partitionEithers args
   hwTy    <- unsafeCoreTypeToHWTypeM' $(curLoc) ty
   (_,sp) <- Lens.use curCompNm
   case appF of
@@ -569,10 +599,34 @@ mkExpr bbEasD bndr ty app = do
     Prim nm _ -> mkPrimitive False bbEasD bndr nm args ty
     Var f
       | null tmArgs -> return (Identifier (nameOcc $ varName f) Nothing,[])
-      | otherwise ->
-        throw (ClashException sp ($(curLoc) ++ "Not in normal form: top-level binder in argument position:\n\n" ++ showPpr app) Nothing)
+      | not (null tyArgs) ->
+          throw (ClashException sp ($(curLoc) ++ "Not in normal form: Var-application with Type arguments:\n\n" ++ showPpr app) Nothing)
+      | otherwise -> do
+          argNm0 <- extendIdentifier Extended (either id id2identifier bndr) "_fun_arg"
+          argNm1 <- mkUniqueIdentifier Extended argNm0
+          hwTyA  <- unsafeCoreTypeToHWTypeM' $(curLoc) ty
+          decls  <- mkFunApp argNm1 f tmArgs
+          return (Identifier argNm1 Nothing, NetDecl' Nothing Wire argNm1 (Right hwTyA):decls)
     Case scrut ty' [alt] -> mkProjection bbEasD bndr scrut ty' alt
-    _ -> throw (ClashException sp ($(curLoc) ++ "Not in normal form: application of a Let/Lam/Case:\n\n" ++ showPpr app) Nothing)
+    Case scrut tyA alts -> do
+      tcm <- Lens.use tcCache
+      let scrutTy = termType tcm scrut
+      scrutHTy <- unsafeCoreTypeToHWTypeM' $(curLoc) scrutTy
+      ite <- Lens.use backEndITE
+      let wr = case iteAlts scrutHTy alts of
+                 Just _ | ite -> Wire
+                 _ -> Reg
+      argNm0 <- extendIdentifier Extended (either id id2identifier bndr) "_sel_arg"
+      argNm1 <- mkUniqueIdentifier Extended argNm0
+      hwTyA  <- unsafeCoreTypeToHWTypeM' $(curLoc) tyA
+      decls  <- mkSelection (Left argNm1) scrut tyA alts
+      return (Identifier argNm1 Nothing, NetDecl' Nothing wr argNm1 (Right hwTyA):decls)
+    Letrec binders body -> do
+      netDecls <- fmap catMaybes $ mapM mkNetDecl binders
+      decls    <- concat <$> mapM (uncurry mkDeclarations) binders
+      (bodyE,bodyDecls) <- mkExpr bbEasD bndr ty (mkApps body args)
+      return (bodyE,netDecls ++ decls ++ bodyDecls)
+    _ -> throw (ClashException sp ($(curLoc) ++ "Not in normal form: application of a Lambda-expression\n\n" ++ showPpr app) Nothing)
 
 -- | Generate an expression that projects a field out of a data-constructor.
 --
@@ -650,7 +704,8 @@ mkProjection mkDec bndr scrut altTy alt@(pat,v) = do
 
 -- | Generate an expression for a DataCon application occurring on the RHS of a let-binder
 mkDcApplication
-    :: HWType
+    :: HasCallStack
+    => HWType
     -- ^ HWType of the LHS of the let-binder
     -> (Either Identifier Id)
     -- ^ Id to assign the result to
@@ -743,4 +798,17 @@ mkDcApplication dstHType bndr dc args = do
         -> pure (head argExprs)
         | dcNm == "GHC.Natural.NatJ#"
         -> pure (head argExprs)
-      _ -> error $ $(curLoc) ++ "mkDcApplication undefined for: " ++ show (dstHType,dc,args,argHWTys)
+--      KnownDomain {} ->
+--        return (Identifier "__KNOWNDOMAIN__" Nothing)
+--        pure $
+--        error $ $(curLoc) ++ "mkDcApplication undefined for KnownDomain. "
+--                          ++ "Did a blackbox definition try to render it? "
+--                          ++ "Context: \n\n"
+--                          ++ "dstHType: " ++ show dstHType ++ "\n\n"
+--                          ++ "dc: " ++ show dc ++ "\n\n"
+--                          ++ "args: " ++ show args ++ "\n\n"
+--                          ++ "argHWTys: " ++ show argHWTys ++ "\n\n"
+--                          ++ "Callstack: "
+--                          ++ prettyCallStack callStack
+      _ ->
+        error $ $(curLoc) ++ "mkDcApplication undefined for: " ++ show (dstHType,dc,args,argHWTys)

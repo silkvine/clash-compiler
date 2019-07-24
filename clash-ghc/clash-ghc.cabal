@@ -1,5 +1,5 @@
 Name:                 clash-ghc
-Version:              0.99
+Version:              0.9999
 Synopsis:             CAES Language for Synchronous Hardware
 Description:
   Clash is a functional hardware description language that borrows both its
@@ -58,6 +58,12 @@ source-repository head
 flag dynamic
   description:
     Build Clash binaries with GHC flag `-dynamic`. This flag should only be used for packaging purposes. Installations using cabal should use `--enable-executable-dynamic`!
+  default: False
+  manual: True
+
+flag use-ghc-paths
+  description:
+    Locate the GHC core libraries using the `ghc-paths` package.  Note: this flag may make binaries less relocatable, by hard-coding an absolute path to the core libraries.
   default: False
   manual: True
 
@@ -132,7 +138,7 @@ library
                       concurrent-supply         >= 0.1.7    && < 0.2,
                       ghc-typelits-extra        >= 0.3      && < 0.4,
                       ghc-typelits-knownnat     >= 0.6      && < 0.7,
-                      ghc-typelits-natnormalise >= 0.6      && < 0.7,
+                      ghc-typelits-natnormalise >= 0.6      && < 0.8,
                       deepseq                   >= 1.3.0.2  && < 1.5,
                       time                      >= 1.4.0.1  && < 1.10,
                       ghc-boot                  >= 8.0.2    && < 8.8,
@@ -144,6 +150,9 @@ library
                       primitive                 >= 0.5.0.1  && < 1.0,
                       template-haskell          >= 2.8.0.0  && < 2.15,
                       vector                    >= 0.11     && < 1.0
+  if flag(use-ghc-paths)
+    Build-Depends:    ghc-paths
+    CPP-Options:      -DUSE_GHC_PATHS=1
 
   if os(windows)
     Build-Depends:    Win32                     >= 2.3.1    && < 2.9
@@ -169,6 +178,7 @@ library
                       Clash.GHC.ClashFlags
                       Clash.GHC.GHC2Core
                       Clash.GHC.LoadInterfaceFiles
+                      Clash.GHC.Util
                       Paths_clash_ghc
   if impl(ghc >= 8.6.0)
     Other-Modules:    Clash.GHCi.Leak

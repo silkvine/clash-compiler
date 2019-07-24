@@ -14,19 +14,32 @@ import Clash.Rewrite.Combinators
 import Clash.Rewrite.Types
 import Clash.Rewrite.Util
 
+-- [Note: bottomup traversal evalConst]
+--
+-- 2-May-2019: There is a bug in the evaluator where all data constructors are
+-- considered lazy, even though their declaration says they have strict fields.
+-- This causes some reductions to fail because the term under the constructor is
+-- not in WHNF, which is what some of the evaluation rules for certain primitive
+-- operations expect. Using a bottom-up traversal works around this bug by
+-- ensuring that the values under the constructor are in WHNF.
+--
+-- Using a bottomup traversal ensures that constants are reduced to NF, even if
+-- constructors are lazy, thus ensuring more sensible/smaller generated HDL.
+
 -- | Normalisation transformation
 normalization :: NormRewrite
-normalization = rmDeadcode >-> constantPropgation >-> etaTL >-> rmUnusedExpr >-!-> anf >-!-> rmDeadcode >->
+normalization = rmDeadcode >-> constantPropagation >-> etaTL >-> rmUnusedExpr >-!-> anf >-!-> rmDeadcode >->
                 bindConst >-> letTL >-> evalConst >-!-> cse >-!-> cleanup >-> recLetRec
   where
-    etaTL      = apply "etaTL" etaExpansionTL !-> innerMost (apply "applicationPropagation" appProp)
+    etaTL      = apply "etaTL" etaExpansionTL !-> topdownR (apply "applicationPropagation" appPropFast)
     anf        = topdownR (apply "nonRepANF" nonRepANF) >-> apply "ANF" makeANF >-> topdownR (apply "caseCon" caseCon)
     letTL      = topdownSucR (apply "topLet" topLet)
     recLetRec  = apply "recToLetRec" recToLetRec
     rmUnusedExpr = bottomupR (apply "removeUnusedExpr" removeUnusedExpr)
     rmDeadcode = bottomupR (apply "deadcode" deadCode)
     bindConst  = topdownR (apply "bindConstantVar" bindConstantVar)
-    evalConst  = topdownR (apply "evalConst" reduceConst)
+    -- See [Note] bottomup traversal evalConst:
+    evalConst  = bottomupR (apply "evalConst" reduceConst)
     cse        = topdownR (apply "CSE" simpleCSE)
     cleanup    = topdownR (apply "etaExpandSyn" etaExpandSyn) >->
                  topdownSucR (apply "inlineCleanup" inlineCleanup) !->
@@ -36,49 +49,43 @@ normalization = rmDeadcode >-> constantPropgation >-> etaTL >-> rmUnusedExpr >-!
                  >-> rmDeadcode >-> letTL
 
 
-constantPropgation :: NormRewrite
-constantPropgation = propagate >-> repeatR inlineAndPropagate >->
+constantPropagation :: NormRewrite
+constantPropagation = inlineAndPropagate >->
                      caseFlattening >-> dec >-> spec >-> dec >->
                      conSpec
   where
-    propagate          = innerMost (applyMany transPropagate)
-    inlineAndPropagate = (topdownR (applyMany transInlineSafe) >-> inlineNR)
-                         !-> propagate
+    inlineAndPropagate = repeatR (topdownR (applyMany transPropagateAndInline) >-> inlineNR)
     spec               = bottomupR (applyMany specTransformations)
     caseFlattening     = repeatR (topdownR (apply "caseFlat" caseFlat))
     dec                = repeatR (topdownR (apply "DEC" disjointExpressionConsolidation))
     conSpec            = bottomupR (apply "constantSpec" constantSpec)
 
-    transPropagate :: [(String,NormRewrite)]
-    transPropagate =
-      [ ("applicationPropagation", appProp              )
+    transPropagateAndInline :: [(String,NormRewrite)]
+    transPropagateAndInline =
+      [ ("applicationPropagation", appPropFast          )
       , ("bindConstantVar"       , bindConstantVar      )
       , ("caseLet"               , caseLet              )
       , ("caseCase"              , caseCase             )
       , ("caseCon"               , caseCon              )
-      , ("caseElemNonReachable"  , caseElemNonReachable )
       , ("elemExistentials"      , elemExistentials     )
+      , ("caseElemNonReachable"  , caseElemNonReachable )
       , ("removeUnusedExpr"      , removeUnusedExpr     )
+      -- These transformations can safely be applied in a top-down traversal as
+      -- they themselves check whether the to-be-inlined binder is recursive or not.
+      , ("inlineWorkFree"  , inlineWorkFree)
+      , ("inlineSmall"     , inlineSmall)
+      , ("bindOrLiftNonRep", inlineOrLiftNonRep) -- See: [Note] bindNonRep before liftNonRep
+                                                 -- See: [Note] bottom-up traversal for liftNonRep
+      , ("reduceNonRepPrim", reduceNonRepPrim)
+
+
+      , ("caseCast"        , caseCast)
+      , ("letCast"         , letCast)
+      , ("splitCastWork"   , splitCastWork)
+      , ("argCastSpec"     , argCastSpec)
+      , ("inlineCast"      , inlineCast)
+      , ("eliminateCastCast",eliminateCastCast)
       ]
-
-    -- These transformations can safely be applied in a top-down traversal as
-    -- they themselves check whether the to-be-inlined binder is recursive or not.
-    transInlineSafe :: [(String,NormRewrite)]
-    transInlineSafe =
-       [ ("inlineWorkFree"  , inlineWorkFree)
-       , ("inlineSmall"     , inlineSmall)
-       , ("bindOrLiftNonRep", inlineOrLiftNonRep) -- See: [Note] bindNonRep before liftNonRep
-                                                  -- See: [Note] bottom-up traversal for liftNonRep
-       , ("reduceNonRepPrim", reduceNonRepPrim)
-
-
-       , ("caseCast"        , caseCast)
-       , ("letCast"         , letCast)
-       , ("splitCastWork"   , splitCastWork)
-       , ("argCastSpec"     , argCastSpec)
-       , ("inlineCast"      , inlineCast)
-       , ("eliminateCastCast",eliminateCastCast)
-       ]
 
     -- InlineNonRep cannot be applied in a top-down traversal, as the non-representable
     -- binder might be recursive. The idea is, is that if the recursive
@@ -211,7 +218,7 @@ bindNonRep will now lead to:
 > f    = \a x -> (a x) && (f a x)
 > f'   = \x -> (not x) && (f not x)
 
-Because `f` has already been specialised on the alpha-equivalent-to-itself `not`
+Because `f` has already been specialized on the alpha-equivalent-to-itself `not`
 function, liftNonRep leads to:
 
 > main = f'
@@ -227,9 +234,16 @@ liftNonRep.
 -- | Topdown traversal, stops upon first success
 topdownSucR :: Rewrite extra -> Rewrite extra
 topdownSucR r = r >-! (allR (topdownSucR r))
+{-# INLINE topdownSucR #-}
+
+topdownRR :: Rewrite extra -> Rewrite extra
+topdownRR r = repeatR (topdownR r)
+{-# INLINE topdownRR #-}
 
 innerMost :: Rewrite extra -> Rewrite extra
-innerMost r = bottomupR (r !-> innerMost r)
+innerMost = let go r = bottomupR (r !-> innerMost r) in go
+{-# INLINE innerMost #-}
 
 applyMany :: [(String,Rewrite extra)] -> Rewrite extra
 applyMany = foldr1 (>->) . map (uncurry apply)
+{-# INLINE applyMany #-}

@@ -1,6 +1,7 @@
 {-|
 Copyright  :  (C) 2013-2016, University of Twente,
                   2017     , Google Inc.
+                  2019     , Myrtle Software Ltd
 License    :  BSD2 (see the file LICENSE)
 Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 -}
@@ -15,9 +16,10 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 module Clash.Prelude.Testbench
   ( -- * Testbench functions for circuits
     assert
-  , stimuliGenerator
+  , ignoreFor
   , outputVerifier
   , outputVerifierBitVector
+  , stimuliGenerator
   )
 where
 
@@ -25,7 +27,9 @@ import GHC.TypeLits                       (KnownNat)
 
 import qualified Clash.Explicit.Testbench as E
 import           Clash.Signal
-  (HiddenClockReset, Signal, hideClockReset)
+  (HiddenClock, HiddenReset, HiddenClockResetEnable, Signal, hideClock,
+  hideReset, hideClockResetEnable)
+import Clash.Promoted.Nat                 (SNat)
 import Clash.Sized.BitVector              (BitVector)
 import Clash.Sized.Vector                 (Vec)
 import Clash.XException                   (ShowX)
@@ -45,47 +49,55 @@ import Clash.XException                   (ShowX)
 --
 -- __NB__: This function /can/ be used in synthesizable designs.
 assert
-  :: (Eq a,ShowX a,HiddenClockReset domain gated synchronous)
-  => String   -- ^ Additional message
-  -> Signal domain a -- ^ Checked value
-  -> Signal domain a -- ^ Expected value
-  -> Signal domain b -- ^ Return value
-  -> Signal domain b
-assert = hideClockReset E.assert
+  :: (Eq a, ShowX a, HiddenClock dom , HiddenReset dom )
+  => String
+  -- ^ Additional message
+  -> Signal dom a
+  -- ^ Checked value
+  -> Signal dom a
+  -- ^ Expected value
+  -> Signal dom b
+  -- ^ Return value
+  -> Signal dom b
+assert msg actual expected ret =
+  hideReset (hideClock E.assert) msg actual expected ret
+
+--assert {-msg actual expected ret-} =
+--  hideReset (hideClock E.assert) {-msg actual expected ret-}
 {-# INLINE assert #-}
 
--- | To be used as one of the functions to create the \"magical\" 'testInput'
--- value, which the Clash compiler looks for to create the stimulus generator
--- for the generated VHDL testbench.
+-- |
 --
 -- Example:
 --
 -- @
 -- testInput
---   :: HiddenClockReset domain gated synchronous
---   => 'Signal' domain Int
+--   :: HiddenClockResetEnable dom
+--   => 'Signal' dom Int
 -- testInput = 'stimuliGenerator' $('Clash.Sized.Vector.listToVecTH' [(1::Int),3..21])
 -- @
 --
 -- >>> sampleN 13 testInput
 -- [1,3,5,7,9,11,13,15,17,19,21,21,21]
 stimuliGenerator
-  :: (KnownNat l, HiddenClockReset domain gated synchronous)
-  => Vec l a  -- ^ Samples to generate
-  -> Signal domain a -- ^ Signal of given samples
-stimuliGenerator = hideClockReset E.stimuliGenerator
+  :: ( KnownNat l
+     , HiddenClock dom
+     , HiddenReset dom  )
+  => Vec l a
+  -- ^ Samples to generate
+  -> Signal dom a
+  -- ^ Signal of given samples
+stimuliGenerator = hideReset (hideClock E.stimuliGenerator)
 {-# INLINE stimuliGenerator #-}
 
--- | To be used as one of the functions to generate the \"magical\" 'expectedOutput'
--- function, which the Clash compiler looks for to create the signal verifier
--- for the generated VHDL testbench.
+-- |
 --
 -- Example:
 --
 -- @
 -- expectedOutput
---   :: HiddenClockReset domain gated synchronous
---   -> 'Signal' domain Int -> 'Signal' domain Bool
+--   :: HiddenClockResetEnable dom
+--   -> 'Signal' dom Int -> 'Signal' dom Bool
 -- expectedOutput = 'outputVerifier' $('Clash.Sized.Vector.listToVecTH' ([70,99,2,3,4,5,7,8,9,10]::[Int]))
 -- @
 --
@@ -111,22 +123,50 @@ stimuliGenerator = hideClockReset E.stimuliGenerator
 -- expected value: 10, not equal to actual value: 9
 -- ,False,True,True]
 --
--- If your working with 'BitVector's containing don't care bit you should use 'outputVerifierBitVector'.
+-- If your working with 'BitVector's containing don't care bits you should use 'outputVerifierBitVector'.
 outputVerifier
-  :: (KnownNat l, Eq a, ShowX a, HiddenClockReset domain gated synchronous)
-  => Vec l a     -- ^ Samples to compare with
-  -> Signal domain a    -- ^ Signal to verify
-  -> Signal domain Bool -- ^ Indicator that all samples are verified
-outputVerifier = hideClockReset E.outputVerifier
+  :: ( KnownNat l
+     , Eq a
+     , ShowX a
+     , HiddenClock dom
+     , HiddenReset dom  )
+  => Vec l a
+  -- ^ Samples to compare with
+  -> Signal dom a
+  -- ^ Signal to verify
+  -> Signal dom Bool
+  -- ^ Indicator that all samples are verified
+outputVerifier = hideReset (hideClock E.outputVerifier)
 {-# INLINE outputVerifier #-}
 
 
 -- | Same as 'outputVerifier',
 -- but can handle don't care bits in it's expected values.
 outputVerifierBitVector
-  :: (KnownNat l, KnownNat n, HiddenClockReset domain gated synchronous)
-  => Vec l (BitVector n)     -- ^ Samples to compare with
-  -> Signal domain (BitVector n)    -- ^ Signal to verify
-  -> Signal domain Bool -- ^ Indicator that all samples are verified
-outputVerifierBitVector = hideClockReset E.outputVerifierBitVector
+  :: ( KnownNat l
+     , KnownNat n
+     , HiddenClock dom
+     , HiddenReset dom  )
+  => Vec l (BitVector n)
+  -- ^ Samples to compare with
+  -> Signal dom (BitVector n)
+  -- ^ Signal to verify
+  -> Signal dom Bool
+  -- ^ Indicator that all samples are verified
+outputVerifierBitVector = hideReset (hideClock E.outputVerifierBitVector)
 {-# INLINE outputVerifierBitVector #-}
+
+-- | Ignore signal for a number of cycles, while outputting a static value.
+ignoreFor
+  :: HiddenClockResetEnable dom
+  => SNat n
+  -- ^ Number of cycles to ignore incoming signal
+  -> a
+  -- ^ Value function produces when ignoring signal
+  -> Signal dom a
+  -- ^ Incoming signal
+  -> Signal dom a
+  -- ^ Either a passthrough of the incoming signal, or the static value
+  -- provided as the second argument.
+ignoreFor = hideClockResetEnable E.ignoreFor
+{-# INLINE ignoreFor #-}

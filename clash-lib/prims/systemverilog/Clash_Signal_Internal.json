@@ -3,20 +3,23 @@
     , "kind" : "Declaration"
     , "type" :
 "delay#
-  :: Clock domain gated       -- ARG[0]
-  -> a                        -- ARG[1]
-  -> Signal clk a             -- ARG[2]
+  :: ( KnownDomain dom        -- ARG[0]
+     , Undefined a )          -- ARG[1]
+  => Clock dom                -- ARG[2]
+  -> Enable dom               -- ARG[3]
+  -> a                        -- ARG[4]
+  -> Signal clk a             -- ARG[5]
   -> Signal clk a"
     , "template" :
 "// delay begin,
-~TYPO ~GENSYM[~RESULT_reg][0] = ~CONST[1];~IF ~ISGATED[0] ~THEN
-always_ff @(posedge ~ARG[0][1]) begin : ~GENSYM[~RESULT_delay][1]
-  if (~ARG[0][0]) begin
-    ~SYM[0] <= ~ARG[2];
+~TYPO ~GENSYM[~RESULT_reg][0] ~IF ~ISINITDEFINED[0] ~THEN = ~CONST[4] ~ELSE ~FI;~IF ~ISACTIVEENABLE[3] ~THEN
+always_ff @(~IF~ACTIVEEDGE[Rising][0]~THENposedge~ELSEnegedge~FI ~ARG[2]) begin : ~GENSYM[~RESULT_delay][1]
+  if (~ARG[3]) begin
+    ~SYM[0] <= ~ARG[5];
   end
 end~ELSE
-always_ff @(posedge ~ARG[0]) begin : ~SYM[1]
-  ~SYM[0] <= ~ARG[2];
+always_ff @(~IF~ACTIVEEDGE[Rising][0]~THENposedge~ELSEnegedge~FI ~ARG[2]) begin : ~SYM[1]
+  ~SYM[0] <= ~ARG[5];
 end~FI
 assign ~RESULT = ~SYM[0];
 // delay end"
@@ -27,78 +30,75 @@ assign ~RESULT = ~SYM[0];
     , "kind" : "Declaration"
     , "type" :
 "register#
-  :: Clock domain gated       -- ARG[0]
-  -> Reset domain synchronous -- ARG[1]
-  -> a                        -- ARG[2] (powerup value)
-  -> a                        -- ARG[3] (reset value)
-  -> Signal clk a             -- ARG[4]
+  :: ( KnownDomain dom        -- ARG[0]
+     , Undefined a )          -- ARG[1]
+  => Clock dom                -- ARG[2]
+  -> Reset dom                -- ARG[3]
+  -> Enable dom               -- ARG[4]
+  -> a                        -- ARG[5] (powerup value)
+  -> a                        -- ARG[6] (reset value)
+  -> Signal clk a             -- ARG[7]
   -> Signal clk a"
     , "template" :
 "// register begin
-~TYPO ~GENSYM[~RESULT_reg][0] = ~CONST[2];~IF ~ISGATED[0] ~THEN
-always_ff @(posedge ~ARG[0][1]~IF ~ISSYNC[1] ~THEN ~ELSE or posedge ~ARG[1]~FI) begin : ~GENSYM[~RESULT_register][1]
-  if (~ARG[1]) begin
-    ~SYM[0] <= ~CONST[3];
-  end else if (~ARG[0][0]) begin
-    ~SYM[0] <= ~ARG[4];
+~TYPO ~GENSYM[~RESULT_reg][0] ~IF ~ISINITDEFINED[0] ~THEN = ~CONST[5] ~ELSE ~FI;
+always_ff @(~IF~ACTIVEEDGE[Rising][0]~THENposedge~ELSEnegedge~FI ~ARG[2]~IF ~ISSYNC[0] ~THEN ~ELSE or ~IF ~ISACTIVEHIGH[0] ~THEN posedge ~ELSE negedge ~FI ~ARG[3]~FI) begin : ~GENSYM[~RESULT_register][1]
+  if (~IF ~ISACTIVEHIGH[0] ~THEN ~ELSE ! ~FI~ARG[3]) begin
+    ~SYM[0] <= ~CONST[6];
+  end else ~IF ~ISACTIVEENABLE[4] ~THEN if (~ARG[4]) ~ELSE ~FI begin
+    ~SYM[0] <= ~ARG[7];
   end
-end~ELSE
-always_ff @(posedge ~ARG[0]~IF ~ISSYNC[1] ~THEN ~ELSE or posedge ~ARG[1]~FI) begin : ~SYM[1]
-  if (~ARG[1]) begin
-    ~SYM[0] <= ~CONST[3];
-  end else begin
-    ~SYM[0] <= ~ARG[4];
-  end
-end~FI
+end
 assign ~RESULT = ~SYM[0];
 // register end"
     }
   }
 , { "BlackBox" :
     { "name" : "Clash.Signal.Internal.clockGen"
+    , "workInfo" : "Always"
     , "kind" : "Declaration"
     , "warning" : "Clash.Signal.Internal.clockGen is not synthesizable!"
     , "type" :
 "clockGen
-  :: (domain ~ Dom nm period -- ARG[0]
-     ,KnownSymbol nm         -- ARG[1]
-     ,KnownNat period)       -- ARG[2]
-  => Clock domain Source"
+  :: KnownDomain dom     -- ARG[0]
+  => Clock dom"
     , "template" :
-"// pragma translate_off
+"// clockGen begin
+// pragma translate_off
 // 1 = 0.1ps
-localparam ~GENSYM[half_period][0] = (~LIT[2]0 / 2);
+localparam ~GENSYM[half_period][0] = (~PERIOD[0]0 / 2);
 always begin
-  ~RESULT = 0;
-  #3000 forever begin
+  ~RESULT = ~IF~ACTIVEEDGE[Rising][0]~THEN 0 ~ELSE 1 ~FI;
+  #30000 forever begin
     ~RESULT = ~ ~RESULT;
     #~SYM[0];
     ~RESULT = ~ ~RESULT;
     #~SYM[0];
   end
 end
-// pragma translate_on"
+// pragma translate_on
+// clockGen end"
     }
   }
 , { "BlackBox" :
     { "name" : "Clash.Signal.Internal.tbClockGen"
+    , "workInfo" : "Always"
     , "kind" : "Declaration"
     , "warning" : "Clash.Signal.Internal.tbClockGen is not synthesizable!"
     , "type" :
 "tbClockGen
-  :: (domain ~ Dom nm period -- ARG[0]
-     ,KnownSymbol nm         -- ARG[1]
-     ,KnownNat period)       -- ARG[2]
-  => Signal domain Bool      -- ARG[3]
-  -> Clock domain Source"
+  :: KnownDomain dom     -- ARG[0]
+  => Signal dom Bool      -- ARG[1]
+  -> Clock dom"
     , "template" :
-"// pragma translate_off
+"// tbClockGen begin
+// pragma translate_off
 // 1 = 0.1ps
-localparam ~GENSYM[half_period][0] = (~LIT[2]0 / 2);
+localparam ~GENSYM[half_period][0] = (~PERIOD[0]0 / 2);
 always begin
-  ~RESULT = 0;
-  #3000 forever begin
-    if (~ ~ARG[3]) begin
+  ~RESULT = ~IF~ACTIVEEDGE[Rising][0]~THEN 0 ~ELSE 1 ~FI;
+  #30000 forever begin
+    if (~ ~ARG[1]) begin
       $finish;
     end
     ~RESULT = ~ ~RESULT;
@@ -107,34 +107,31 @@ always begin
     #~SYM[0];
   end
 end
-// pragma translate_on"
+// pragma translate_on
+// tbClockGen end"
     }
   }
 , { "BlackBox" :
-    { "name" : "Clash.Signal.Internal.asyncResetGen"
+    { "name" : "Clash.Signal.Internal.resetGen"
+    , "workInfo" : "Always"
     , "kind" : "Declaration"
-    , "type" : "asyncResetGen :: Reset domain Asynchronous"
+    , "type" : "resetGen :: KnownDomain dom      => Reset dom"
     , "template" :
-"// pragma translate_off
+"// resetGen begin
+// pragma translate_off
+~IF~ISSYNC[0]~THEN
+localparam ~GENSYM[reset_period][1] = 29998 + ~PERIOD[0]0;
 initial begin
-  #1    ~RESULT = 1;
-  #3001 ~RESULT = 0;
-end
-// pragma translate_on"
-    }
-  }
-, { "BlackBox" :
-    { "name" : "Clash.Signal.Internal.syncResetGen"
-    , "kind" : "Declaration"
-    , "type" : "asyncResetGen :: Reset domain Synchronous"
-    , "template" :
-"// pragma translate_off
-localparam ~GENSYM[reset_period][1] = 2998 + ~LIT[1]0;
+  #1 ~RESULT = ~IF ~ISACTIVEHIGH[0] ~THEN 1 ~ELSE 0 ~FI;
+  #~SYM[1] ~RESULT = ~IF ~ISACTIVEHIGH[0] ~THEN 0 ~ELSE 1 ~FI;
+end~ELSE
 initial begin
-  #1 ~RESULT = 1;
-  #~SYM[1] ~RESULT = 0;
+  #1     ~RESULT = ~IF ~ISACTIVEHIGH[0] ~THEN 1 ~ELSE 0 ~FI;
+  #30001 ~RESULT = ~IF ~ISACTIVEHIGH[0] ~THEN 0 ~ELSE 1 ~FI;
 end
-// pragma translate_on"
+~FI
+// pragma translate_on
+// resetGen end"
     }
   }
 ]

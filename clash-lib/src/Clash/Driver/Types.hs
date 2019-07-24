@@ -70,6 +70,23 @@ data ClashOpts = ClashOpts { opt_inlineLimit :: Int
                            , opt_componentPrefix :: Maybe String
                            , opt_newInlineStrat :: Bool
                            , opt_escapedIds :: Bool
+                           , opt_ultra :: Bool
+                           -- ^ Perform a high-effort compile, trading improved
+                           -- performance for potentially much longer compile
+                           -- times.
+                           --
+                           -- Name inspired by Design Compiler's /compile_ultra/
+                           -- flag.
+                           , opt_forceUndefined :: Maybe (Maybe Int)
+                           -- ^
+                           -- * /Nothing/: generate undefined's in the HDL
+                           --
+                           -- * /Just Nothing/: replace undefined's by a
+                           -- constant in the HDL; the compiler decides what's
+                           -- best
+                           --
+                           -- * /Just (Just x)/: replace undefined's by /x/ in
+                           -- the HDL
                            }
 
 
@@ -98,6 +115,8 @@ defClashOpts tmpDir
   , opt_componentPrefix     = Nothing
   , opt_newInlineStrat      = True
   , opt_escapedIds          = True
+  , opt_ultra               = False
+  , opt_forceUndefined      = Nothing
   }
 
 -- | Information about the generated HDL between (sub)runs of the compiler

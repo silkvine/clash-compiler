@@ -1,12 +1,13 @@
 {-|
 Copyright  :  (C) 2015-2016, University of Twente,
-                  2017     , Myrtle Software Ltd, Google Inc.
+                  2017     , Google Inc.
+                  2019     , Myrtle Software Ltd
 License    :  BSD2 (see the file LICENSE)
 Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 
-= Initialising a BlockRAM with a data file #usingramfiles#
+= Initializing a BlockRAM with a data file #usingramfiles#
 
-BlockRAM primitives that can be initialised with a data file. The BNF grammar
+BlockRAM primitives that can be initialized with a data file. The BNF grammar
 for this data file is simple:
 
 @
@@ -34,9 +35,9 @@ We can instantiate a BlockRAM using the content of the above file like so:
 
 @
 f
-  :: Clock  domain gated
-  -> Signal domain (Unsigned 3)
-  -> Signal domain (Unsigned 9)
+  :: Clock  dom
+  -> Signal dom (Unsigned 3)
+  -> Signal dom (Unsigned 9)
 f clk rd = 'Clash.Class.BitPack.unpack' '<$>' 'blockRamFile' clk d7 \"memory.bin\" rd (signal Nothing)
 @
 
@@ -54,9 +55,9 @@ number, and a 3-bit signed number:
 
 @
 g
-  :: Clock  domain Source
-  -> Signal domain (Unsigned 3)
-  -> Signal domain (Unsigned 6,Signed 3)
+  :: Clock  dom
+  -> Signal dom (Unsigned 3)
+  -> Signal dom (Unsigned 6,Signed 3)
 g clk rd = 'Clash.Class.BitPack.unpack' '<$>' 'blockRamFile' clk d7 \"memory.bin\" rd (signal Nothing)
 @
 
@@ -88,7 +89,7 @@ __>>> L.tail $ sampleN 4 $ g systemClockGen (fromList [3..5])__
 {-# OPTIONS_GHC -fno-cpr-anal #-}
 
 module Clash.Explicit.BlockRam.File
-  ( -- * BlockRAM synchronised to an arbitrary clock
+  ( -- * BlockRAM synchronized to an arbitrary clock
     blockRamFile
   , blockRamFilePow2
     -- * Internal
@@ -107,10 +108,11 @@ import System.IO.Unsafe      (unsafePerformIO)
 
 import Clash.Promoted.Nat    (SNat (..), pow2SNat)
 import Clash.Sized.BitVector (BitVector)
-import Clash.Signal.Internal (Clock, Signal (..), (.&&.), clockEnable)
+import Clash.Signal.Internal
+  (Clock(..), Signal (..), Enable, KnownDomain, fromEnable, (.&&.))
 import Clash.Signal.Bundle   (unbundle)
 import Clash.Sized.Unsigned  (Unsigned)
-import Clash.XException      (errorX, maybeX, seqX)
+import Clash.XException      (errorX, maybeIsX, seqX)
 
 
 -- | Create a blockRAM with space for 2^@n@ elements
@@ -140,19 +142,22 @@ import Clash.XException      (errorX, maybeX, seqX)
 -- * See "Clash.Explicit.Fixed#creatingdatafiles" for ideas on how to create your
 -- own data files.
 blockRamFilePow2
-  :: forall dom gated n m
-   . (KnownNat m, KnownNat n, HasCallStack)
-  => Clock dom gated
+  :: forall dom n m
+   . (KnownDomain dom, KnownNat m, KnownNat n, HasCallStack)
+  => Clock dom
   -- ^ 'Clock' to synchronize to
+  -> Enable dom
+  -- ^ Global enable
   -> FilePath
   -- ^ File describing the initial content of the blockRAM
-  -> Signal dom (Unsigned n)  -- ^ Read address @r@
+  -> Signal dom (Unsigned n)
+  -- ^ Read address @r@
   -> Signal dom (Maybe (Unsigned n, BitVector m))
   -- ^ (write address @w@, value to write)
   -> Signal dom (BitVector m)
   -- ^ Value of the @blockRAM@ at address @r@ from the previous clock cycle
-blockRamFilePow2 = \clk file rd wrM -> withFrozenCallStack
-  (blockRamFile clk (pow2SNat (SNat @ n)) file rd wrM)
+blockRamFilePow2 = \clk en file rd wrM -> withFrozenCallStack
+  (blockRamFile clk en (pow2SNat (SNat @ n)) file rd wrM)
 {-# INLINE blockRamFilePow2 #-}
 
 -- | Create a blockRAM with space for @n@ elements
@@ -182,9 +187,11 @@ blockRamFilePow2 = \clk file rd wrM -> withFrozenCallStack
 -- * See "Clash.Sized.Fixed#creatingdatafiles" for ideas on how to create your
 -- own data files.
 blockRamFile
-  :: (KnownNat m, Enum addr, HasCallStack)
-  => Clock dom gated
+  :: (KnownDomain dom, KnownNat m, Enum addr, HasCallStack)
+  => Clock dom
   -- ^ 'Clock' to synchronize to
+  -> Enable dom
+  -- ^ Global enable
   -> SNat n
   -- ^ Size of the blockRAM
   -> FilePath
@@ -196,18 +203,21 @@ blockRamFile
   -> Signal dom (BitVector m)
   -- ^ Value of the @blockRAM@ at address @r@ from the previous
   -- clock cycle
-blockRamFile = \clk sz file rd wrM ->
+blockRamFile = \clk gen sz file rd wrM ->
   let en       = isJust <$> wrM
       (wr,din) = unbundle (fromJust <$> wrM)
   in  withFrozenCallStack
-      (blockRamFile# clk sz file (fromEnum <$> rd) en (fromEnum <$> wr) din)
+      (blockRamFile# clk gen sz file (fromEnum <$> rd) en (fromEnum <$> wr) din)
 {-# INLINE blockRamFile #-}
 
 -- | blockRamFile primitive
 blockRamFile#
-  :: (KnownNat m, HasCallStack)
-  => Clock dom gated
+  :: forall m dom n
+   . (KnownDomain dom, KnownNat m, HasCallStack)
+  => Clock dom
   -- ^ 'Clock' to synchronize to
+  -> Enable dom
+  -- ^ Global enable
   -> SNat n
   -- ^ Size of the blockRAM
   -> FilePath
@@ -222,41 +232,45 @@ blockRamFile#
   -- ^ Value to write (at address @w@)
   -> Signal dom (BitVector m)
   -- ^ Value of the @blockRAM@ at address @r@ from the previous clock cycle
-blockRamFile# clk _sz file rd wen = case clockEnable clk of
-  Nothing ->
-    go ramI
-       (withFrozenCallStack (errorX "blockRamFile#: intial value undefined"))
-       rd wen
-  Just ena ->
-    go' ramI
-       (withFrozenCallStack (errorX "blockRamFile#: intial value undefined"))
-       ena rd (ena .&&. wen)
+blockRamFile# (Clock _) ena _sz file rd wen =
+  go
+    ramI
+    (withFrozenCallStack (errorX "blockRamFile#: intial value undefined"))
+    (fromEnable ena)
+    rd
+    (fromEnable ena .&&. wen)
   where
-    -- no clock enable
-    go !ram o (r :- rs) (e :- en) (w :- wr) (d :- din) =
-      let ram' = upd ram e (fromEnum w) d
-          o'   = ram V.! r
-      in  o `seqX` o :- go ram' o' rs en wr din
     -- clock enable
-    go' !ram o (re :- res) (r :- rs) (e :- en) (w :- wr) (d :- din) =
+    go
+      :: V.Vector (BitVector m)
+      -> BitVector m
+      -> Signal dom Bool
+      -> Signal dom Int
+      -> Signal dom Bool
+      -> Signal dom Int
+      -> Signal dom (BitVector m)
+      -> Signal dom (BitVector m)
+    go !ram o (re :- res) (r :- rs) (e :- en) (w :- wr) (d :- din) =
       let ram' = upd ram e (fromEnum w) d
           o'   = if re then ram V.! r else o
-      in  o `seqX` o :- go' ram' o' res rs en wr din
+      in  o `seqX` o :- go ram' o' res rs en wr din
 
-    upd ram we waddr d = case maybeX we of
-      Nothing -> case maybeX waddr of
+    upd ram we waddr d = case maybeIsX we of
+      Nothing -> case maybeIsX waddr of
         Nothing -> V.map (const (seq waddr d)) ram
         Just wa -> ram V.// [(wa,d)]
-      Just True -> case maybeX waddr of
+      Just True -> case maybeIsX waddr of
         Nothing -> V.map (const (seq waddr d)) ram
         Just wa -> ram V.// [(wa,d)]
       _ -> ram
 
     content = unsafePerformIO (initMem file)
-    ramI    = V.fromList content
+
+    ramI :: V.Vector (BitVector m)
+    ramI = V.fromList content
 {-# NOINLINE blockRamFile# #-}
 
--- | __NB:__ Not synthesisable
+-- | __NB:__ Not synthesizable
 initMem :: KnownNat n => FilePath -> IO [BitVector n]
 initMem = fmap (map parseBV . lines) . readFile
   where

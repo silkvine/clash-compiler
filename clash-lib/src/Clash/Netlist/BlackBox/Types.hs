@@ -31,7 +31,10 @@ import                GHC.Generics               (Generic)
 import                Clash.Core.Term            (Term)
 import                Clash.Core.Type            (Type)
 import                Clash.Core.Var             (Id)
-import {-# SOURCE #-} Clash.Netlist.Types        (BlackBox, Identifier)
+import {-# SOURCE #-} Clash.Netlist.Types
+  (BlackBox, Identifier, NetlistMonad)
+
+import qualified      Clash.Signal.Internal      as Signal
 
 data TemplateKind
   = TDecl
@@ -67,9 +70,10 @@ type BlackBoxFunction
   -- ^ Arguments
   -> Type
   -- ^ Result type
-  -> Either String (BlackBoxMeta, BlackBox)
+  -> NetlistMonad (Either String (BlackBoxMeta, BlackBox))
 
 -- | A BlackBox Template is a List of Elements
+-- TODO: Add name of function for better error messages
 type BlackBoxTemplate = [Element]
 
 -- | Elements of a blackbox context. If you extend this list, make sure to
@@ -125,6 +129,8 @@ data Element
   -- ^ Length of a vector hole
   | Depth !Element
   -- ^ Depth of a tree hole
+  | MaxIndex !Element
+  -- ^ Max index into a vector
   | FilePath !Element
   -- ^ Hole containing a filepath for a data file
   | Template [Element] [Element]
@@ -145,8 +151,21 @@ data Element
   -- ^ Record selector of a type
   | IsLit !Int
   | IsVar !Int
-  | IsGated !Int
+  | IsActiveHigh !Int
+  -- ^ Whether a domain's reset lines are synchronous.
+  | Tag !Int
+  -- ^ Tag of a domain.
+  | Period !Int
+  -- ^ Period of a domain.
+  | ActiveEdge !Signal.ActiveEdge !Int
+  -- ^ Test active edge of memory elements in a certain domain
   | IsSync !Int
+  -- ^ Whether a domain's reset lines are synchronous. Errors if not applied to
+  -- a KnownDomain.
+  | IsInitDefined !Int
+  | IsActiveEnable !Int
+  -- ^ Whether given enable line is active. More specifically, whether the
+  -- enable line is NOT set to a constant 'True'.
   | StrCmp [Element] !Int
   | OutputWireReg !Int
   | Vars !Int

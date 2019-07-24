@@ -8,6 +8,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 {-# LANGUAGE BangPatterns         #-}
 {-# LANGUAGE CPP                  #-}
 {-# LANGUAGE DataKinds            #-}
+{-# LANGUAGE FlexibleInstances    #-}
 {-# LANGUAGE GADTs                #-}
 {-# LANGUAGE KindSignatures       #-}
 {-# LANGUAGE MagicHash            #-}
@@ -94,7 +95,7 @@ module Clash.Sized.Vector
   , bv2v
   , v2bv
     -- * Misc
-  , lazyV, VCons, asNatProxy
+  , lazyV, VCons, asNatProxy, seqV, forceV, seqVX, forceVX
     -- * Primitives
     -- ** 'Traversable' instance
   , traverse#
@@ -106,6 +107,10 @@ where
 
 import Control.DeepSeq            (NFData (..))
 import qualified Control.Lens     as Lens hiding (pattern (:>), pattern (:<))
+import Data.Constraint            ((:-)(..), Dict (..))
+import Data.Constraint.Nat        (leZero)
+import Data.Data
+  (Data (..), Constr, DataType, Fixity (..), Typeable, mkConstr, mkDataType)
 import Data.Default.Class         (Default (..))
 import qualified Data.Foldable    as F
 import Data.Kind                  (Type)
@@ -114,6 +119,7 @@ import Data.Singletons.Prelude    (TyFun,Apply,type (@@))
 import GHC.TypeLits               (CmpNat, KnownNat, Nat, type (+), type (-), type (*),
                                    type (^), type (<=), natVal)
 import GHC.Base                   (Int(I#),Int#,isTrue#)
+import GHC.Generics               hiding (Fixity (..))
 import GHC.Prim                   ((==#),(<#),(-#))
 import Language.Haskell.TH        (ExpQ)
 import Language.Haskell.TH.Syntax (Lift(..))
@@ -128,14 +134,15 @@ import Test.QuickCheck            (Arbitrary (..), CoArbitrary (..))
 import Unsafe.Coerce              (unsafeCoerce)
 
 import Clash.Promoted.Nat
-  (SNat (..), UNat (..), leToPlus, pow2SNat, snatProxy, snatToInteger, subSNat,
-   withSNat, toUNat)
+  (SNat (..), SNatLE (..), UNat (..), compareSNat, leToPlus, pow2SNat,
+   snatProxy, snatToInteger, subSNat, withSNat, toUNat)
 import Clash.Promoted.Nat.Literals (d1)
 import Clash.Sized.Internal.BitVector (Bit, BitVector, (++#), split#)
 import Clash.Sized.Index          (Index)
 
-import Clash.Class.BitPack (BitPack (..), packXWith)
-import Clash.XException    (ShowX (..), Undefined (..), showsX, showsPrecXWith)
+import Clash.Class.BitPack        (packXWith, BitPack (..))
+import Clash.XException
+  (ShowX (..), Undefined (..), showsX, showsPrecXWith, seqX)
 
 {- $setup
 >>> :set -XDataKinds
@@ -200,9 +207,56 @@ data Vec :: Nat -> Type -> Type where
   Nil  :: Vec 0 a
   Cons :: a -> Vec n a -> Vec (n + 1) a
 
+-- | In many cases, this Generic instance only allows generic
+-- functions/instances over vectors of at least size 1, due to the
+-- /n-1/ in the /Rep (Vec n a)/ definition.
+--
+-- We'll have to wait for things like
+-- https://ryanglscott.github.io/2018/02/11/how-to-derive-generic-for-some-gadts/
+-- before we can work around this limitation
+instance KnownNat n => Generic (Vec n a) where
+  type Rep (Vec n a) =
+    D1 ('MetaData "Vec" "Clash.Data.Vector" "clash-prelude" 'False)
+      (C1 ('MetaCons "Nil" 'PrefixI 'False) U1 :+:
+       C1 ('MetaCons "Cons" 'PrefixI 'False)
+        (S1 ('MetaSel 'Nothing
+                'NoSourceUnpackedness
+                'NoSourceStrictness
+                'DecidedLazy)
+            (Rec0 a) :*:
+         S1 ('MetaSel 'Nothing
+                'NoSourceUnpackedness
+                'NoSourceStrictness
+                'DecidedLazy)
+            (Rec0 (Vec (n-1) a))))
+  from Nil         = M1 (L1 (M1 U1))
+  from (Cons x xs) = M1 (R1 (M1 (M1 (K1 x) :*: M1 (K1 xs))))
+  to (M1 g) = case compareSNat (SNat @n) (SNat @0) of
+    SNatLE -> case leZero @n of
+      Sub Dict -> Nil
+    SNatGT -> case g of
+      R1 (M1 (M1 (K1 p) :*: M1 (K1 q))) -> Cons p q
+
+instance (KnownNat n, Typeable a, Data a) => Data (Vec n a) where
+  gunfold k z _ = case compareSNat (SNat @n) (SNat @0) of
+    SNatLE -> case leZero @n of
+      Sub Dict -> z Nil
+    SNatGT -> k (k (z @(a -> Vec (n-1) a -> Vec n a) Cons))
+  toConstr Nil        = cNil
+  toConstr (Cons _ _) = cCons
+  dataTypeOf _        = tVec
+
+tVec :: DataType
+tVec = mkDataType "Vec" [cNil, cCons]
+
+cNil :: Constr
+cNil = mkConstr tVec "Nil" [] Prefix
+
+cCons :: Constr
+cCons = mkConstr tVec "Cons" [] Prefix
+
 instance NFData a => NFData (Vec n a) where
-  rnf Nil         = ()
-  rnf (Cons x xs) = rnf x `seq` rnf xs
+  rnf = foldl (\() -> rnf) ()
 
 -- | Add an element to the head of a vector.
 --
@@ -296,6 +350,13 @@ instance (Default a, KnownNat n) => Default (Vec n a) where
 
 instance (Undefined a, KnownNat n) => Undefined (Vec n a) where
   deepErrorX x = repeat (deepErrorX x)
+
+  rnfX v =
+    -- foldl will fail if the spine of the vector is undefined, so we need to
+    -- seqX the result of it. We need to use foldl so Clash won't treat it as
+    -- a recursive function.
+    seqX (foldl (\() -> rnfX) () v) ()
+
 
 {-# INLINE singleton #-}
 -- | Create a vector of one element
@@ -719,7 +780,7 @@ elemIndex :: (KnownNat n, Eq a) => a -> Vec n a -> Maybe (Index n)
 elemIndex x = findIndex (x ==)
 {-# INLINE elemIndex #-}
 
--- | 'zipWith' generalises 'zip' by zipping with the function given
+-- | 'zipWith' generalizes 'zip' by zipping with the function given
 -- as the first argument, instead of a tupling function.
 -- For example, \"'zipWith' @(+)@\" applied to two vectors produces the
 -- vector of corresponding sums.
@@ -738,7 +799,7 @@ zipWith _ Nil           _  = Nil
 zipWith f (x `Cons` xs) ys = f x (head ys) `Cons` zipWith f xs (tail ys)
 {-# NOINLINE zipWith #-}
 
--- | 'zipWith3' generalises 'zip3' by zipping with the function given
+-- | 'zipWith3' generalizes 'zip3' by zipping with the function given
 -- as the first argument, instead of a tupling function.
 --
 -- > zipWith3 f (x1 :> x2 :> ... xn :> Nil) (y1 :> y2 :> ... :> yn :> Nil) (z1 :> z2 :> ... :> zn :> Nil) == (f x1 y1 z1 :> f x2 y2 z2 :> ... :> f xn yn zn :> Nil)
@@ -1542,7 +1603,7 @@ windows2d stY stX xss = map (transpose . (map (windows1d stX))) (windows1d stY x
 {-# INLINE windows2d #-}
 
 -- | Forward permutation specified by an index mapping, /ix/. The result vector
--- is initialised by the given defaults, /def/, and an further values that are
+-- is initialized by the given defaults, /def/, and an further values that are
 -- permuted into the result are added to the current value using the given
 -- combination function, /f/.
 --
@@ -2116,6 +2177,49 @@ bv2v = unpack
 -- 0001_0010
 v2bv :: KnownNat n => Vec n Bit -> BitVector n
 v2bv = pack
+
+-- | Evaluate all elements of a vector to WHNF, returning the second argument
+seqV
+  :: KnownNat n
+  => Vec n a
+  -> b
+  -> b
+seqV v b =
+  let s () e = seq e () in
+  foldl s () v `seq` b
+{-# NOINLINE seqV #-}
+infixr 0 `seqV`
+
+-- | Evaluate all elements of a vector to WHNF
+forceV
+  :: KnownNat n
+  => Vec n a
+  -> Vec n a
+forceV v =
+  v `seqV` v
+{-# INLINE forceV #-}
+
+-- | Evaluate all elements of a vector to WHNF, returning the second argument.
+-- Does not propagate 'XException's.
+seqVX
+  :: KnownNat n
+  => Vec n a
+  -> b
+  -> b
+seqVX v b =
+  let s () e = seqX e () in
+  foldl s () v `seqX` b
+{-# NOINLINE seqVX #-}
+infixr 0 `seqVX`
+
+-- | Evaluate all elements of a vector to WHNF. Does not propagate 'XException's.
+forceVX
+  :: KnownNat n
+  => Vec n a
+  -> Vec n a
+forceVX v =
+  v `seqVX` v
+{-# INLINE forceVX #-}
 
 instance Lift a => Lift (Vec n a) where
   lift Nil           = [| Nil |]

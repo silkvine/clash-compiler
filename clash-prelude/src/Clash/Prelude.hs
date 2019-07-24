@@ -1,6 +1,7 @@
 {-|
   Copyright   :  (C) 2013-2016, University of Twente,
-                     2017     , Myrtle Software Ltd, Google Inc.
+                     2017-2019, Myrtle Software Ltd
+                     2017     , Google Inc.
   License     :  BSD2 (see the file LICENSE)
   Maintainer  :  Christiaan Baaij <christiaan.baaij@gmail.com>
 
@@ -53,7 +54,7 @@ module Clash.Prelude
   , asyncRomPow2
   , rom
   , romPow2
-    -- ** ROMs initialised with a data file
+    -- ** ROMs initialized with a data file
   , asyncRomFile
   , asyncRomFilePow2
   , romFile
@@ -64,7 +65,9 @@ module Clash.Prelude
     -- * BlockRAM primitives
   , blockRam
   , blockRamPow2
-    -- ** BlockRAM primitives initialised with a data file
+  , blockRam1
+  , E.ResetStrategy(..)
+    -- ** BlockRAM primitives initialized with a data file
   , blockRamFile
   , blockRamFilePow2
     -- ** BlockRAM read/write conflict resolution
@@ -124,6 +127,7 @@ module Clash.Prelude
     -- ** Type classes
     -- *** Clash
   , module Clash.Class.BitPack
+  , module Clash.Class.Exp
   , module Clash.Class.Num
   , module Clash.Class.Resize
     -- *** Other
@@ -153,10 +157,11 @@ import           Language.Haskell.TH.Syntax  (Lift(..))
 import           Prelude hiding
   ((++), (!!), concat, concatMap, drop, foldl, foldl1, foldr, foldr1, head, init,
    iterate, last, length, map, repeat, replicate, reverse, scanl, scanr, splitAt,
-   tail, take, unzip, unzip3, zip, zip3, zipWith, zipWith3, undefined)
+   tail, take, unzip, unzip3, zip, zip3, zipWith, zipWith3, undefined, (^))
 
 import           Clash.Annotations.TopEntity
 import           Clash.Class.BitPack
+import           Clash.Class.Exp
 import           Clash.Class.Num
 import           Clash.Class.Resize
 import qualified Clash.Explicit.Prelude      as E
@@ -164,6 +169,7 @@ import           Clash.Hidden
 import           Clash.NamedTypes
 import           Clash.Prelude.BitIndex
 import           Clash.Prelude.BitReduction
+import           Clash.Prelude.BlockRam
 import           Clash.Prelude.BlockRam.File
 import           Clash.Prelude.DataFlow
 import           Clash.Prelude.ROM.File
@@ -185,9 +191,9 @@ import           Clash.Signal.Trace
 import           Clash.XException
 
 {- $setup
->>> :set -XDataKinds -XFlexibleContexts
->>> let window4  = window  :: HiddenClockReset domain gated synchronous => Signal domain Int -> Vec 4 (Signal domain Int)
->>> let windowD3 = windowD :: HiddenClockReset domain gated synchronous => Signal domain Int -> Vec 3 (Signal domain Int)
+>>> :set -XDataKinds -XFlexibleContexts -XTypeApplications
+>>> let window4  = window  :: HiddenClockResetEnable dom  => Signal dom Int -> Vec 4 (Signal dom Int)
+>>> let windowD3 = windowD :: HiddenClockResetEnable dom  => Signal dom Int -> Vec 3 (Signal dom Int)
 -}
 
 {- $hiding
@@ -203,32 +209,44 @@ It instead exports the identically named functions defined in terms of
 
 -- | Give a window over a 'Signal'
 --
--- > window4 :: HiddenClockReset domain gated synchronous
--- >         => Signal domain Int -> Vec 4 (Signal domain Int)
+-- > window4 :: HiddenClockResetEnable dom
+-- >         => Signal dom Int -> Vec 4 (Signal dom Int)
 -- > window4 = window
 --
--- >>> simulateB window4 [1::Int,2,3,4,5] :: [Vec 4 Int]
+-- >>> simulateB @System window4 [1::Int,2,3,4,5] :: [Vec 4 Int]
 -- [<1,0,0,0>,<2,1,0,0>,<3,2,1,0>,<4,3,2,1>,<5,4,3,2>...
 -- ...
 window
-  :: (KnownNat n, Default a, HiddenClockReset domain gated synchronous)
-  => Signal domain a                -- ^ Signal to create a window over
-  -> Vec (n + 1) (Signal domain a)  -- ^ Window of at least size 1
-window = hideClockReset E.window
+  :: ( HiddenClockResetEnable dom
+     , KnownNat n
+     , Default a
+     , Undefined a )
+  => Signal dom a
+  -- ^ Signal to create a window over
+  -> Vec (n + 1) (Signal dom a)
+  -- ^ Window of at least size 1
+window = hideClockResetEnable E.window
 {-# INLINE window #-}
 
 -- | Give a delayed window over a 'Signal'
 --
--- > windowD3 :: HiddenClockReset domain gated synchronous
--- >          => Signal domain Int -> Vec 3 (Signal domain Int)
+-- > windowD3
+-- >   :: HiddenClockResetEnable dom
+-- >   => Signal dom Int
+-- >   -> Vec 3 (Signal dom Int)
 -- > windowD3 = windowD
 --
--- >>> simulateB windowD3 [1::Int,2,3,4] :: [Vec 3 Int]
+-- >>> simulateB @System windowD3 [1::Int,2,3,4] :: [Vec 3 Int]
 -- [<0,0,0>,<1,0,0>,<2,1,0>,<3,2,1>,<4,3,2>...
 -- ...
 windowD
-  :: (KnownNat n, Default a, HiddenClockReset domain gated synchronous)
-  => Signal domain a               -- ^ Signal to create a window over
-  -> Vec (n + 1) (Signal domain a) -- ^ Window of at least size 1
-windowD = hideClockReset E.windowD
+  :: ( HiddenClockResetEnable dom
+     , KnownNat n
+     , Default a
+     , Undefined a )
+  => Signal dom a
+  -- ^ Signal to create a window over
+  -> Vec (n + 1) (Signal dom a)
+  -- ^ Window of at least size 1
+windowD = hideClockResetEnable E.windowD
 {-# INLINE windowD #-}

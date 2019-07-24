@@ -63,6 +63,7 @@ import Control.Applicative         (liftA2)
 import Control.DeepSeq             (NFData(..))
 import qualified Control.Lens      as Lens
 import Data.Default.Class          (Default (..))
+import Data.Either                 (isLeft)
 import Data.Foldable               (toList)
 import Data.Kind                   (Type)
 import Data.Singletons.Prelude     (Apply, TyFun, type (@@))
@@ -80,7 +81,7 @@ import Clash.Promoted.Nat.Literals (d1)
 import Clash.Sized.Index           (Index)
 import Clash.Sized.Vector          (Vec (..), (!!), (++), dtfold, replace)
 import Clash.XException
-  (ShowX (..), Undefined (..), showsX, showsPrecXWith)
+  (ShowX (..), Undefined (..), isX, showsX, showsPrecXWith)
 
 {- $setup
 >>> :set -XDataKinds
@@ -228,6 +229,13 @@ instance (KnownNat d, CoArbitrary a) => CoArbitrary (RTree d a) where
 
 instance (KnownNat d, Undefined a) => Undefined (RTree d a) where
   deepErrorX x = pure (deepErrorX x)
+
+  rnfX t = if isLeft (isX t) then () else go t
+   where
+    go :: RTree d a -> ()
+    go (LR_ x)   = rnfX x
+    go (BR_ l r) = rnfX l `seq` rnfX r
+
 
 -- | A /dependently/ typed fold over trees.
 --
@@ -448,7 +456,7 @@ replaceTree i a = v2t . replace i a . t2v
 data ZipWithTree (b :: Type) (c :: Type) (f :: TyFun Nat Type) :: Type
 type instance Apply (ZipWithTree b c) d = RTree d b -> RTree d c
 
--- | 'tzipWith' generalises 'tzip' by zipping with the function given as the
+-- | 'tzipWith' generalizes 'tzip' by zipping with the function given as the
 -- first argument, instead of a tupling function. For example, "tzipWith (+)"
 -- applied to two trees produces the tree of corresponding sums.
 --

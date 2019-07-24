@@ -24,7 +24,9 @@ import           Control.Exception       (throw)
 import           Control.Lens            ((.=),(%=))
 import qualified Control.Lens            as Lens
 import           Control.Monad           (unless, when, zipWithM, join)
-import           Control.Monad.Trans.Except (runExcept)
+import           Control.Monad.State.Strict
+  (State, evalState, get, modify, runState)
+import           Control.Monad.Trans.Except (ExceptT (..), runExceptT, throwE)
 import           Data.Either             (partitionEithers)
 import           Data.HashMap.Strict     (HashMap)
 import qualified Data.HashMap.Strict     as HashMap
@@ -48,26 +50,26 @@ import           Clash.Annotations.BitRepresentation.Internal
 import           Clash.Annotations.TopEntity (PortName (..), TopEntity (..))
 import           Clash.Driver.Types      (Manifest (..))
 import           Clash.Core.DataCon      (DataCon (..))
-import           Clash.Core.FreeVars     (termFreeIds, typeFreeVars)
+import           Clash.Core.FreeVars     (freeLocalIds, typeFreeVars)
+import qualified Clash.Core.Literal      as C
 import           Clash.Core.Name
   (Name (..), appendToName, nameOcc)
 import           Clash.Core.Pretty       (showPpr)
 import           Clash.Core.Subst
   (Subst (..), extendIdSubst, extendIdSubstList, extendInScopeId,
-   extendInScopeIdList, extendTvSubstList, mkSubst, substTm, substTy, substTyWith)
-import           Clash.Core.Term         (LetBinding, Term (..))
+   extendInScopeIdList, mkSubst, substTm)
+import           Clash.Core.Term         (Alt, LetBinding, Pat (..), Term (..))
 import           Clash.Core.TyCon
   (TyConName, TyConMap, tyConDataCons)
-import           Clash.Core.Type         (Type (..), TypeView (..), LitTy (..),
+import           Clash.Core.Type         (Type (..), TypeView (..),
                                           coreView1, splitTyConAppM, tyView, TyVar)
-import           Clash.Core.Util         (collectBndrs, termType, tyNatSize)
-import           Clash.Core.Var          (Id, Var (..), mkId, modifyVarName, Attr')
+import           Clash.Core.Util         (collectBndrs, substArgTys, termType)
+import           Clash.Core.Var
+  (Id, Var (..), mkLocalId, modifyVarName, Attr')
 import           Clash.Core.VarEnv
-  (emptyVarSet, extendInScopeSetList, mkInScopeSet, unionVarSet, uniqAway,
-   unitVarSet, mkVarSet)
+  (InScopeSet, extendInScopeSetList, uniqAway)
 import           Clash.Netlist.Id        (IdType (..), stripDollarPrefixes)
 import           Clash.Netlist.Types     as HW
-import           Clash.Signal.Internal   (ClockKind (..))
 import           Clash.Unique
 import           Clash.Util
 
@@ -107,7 +109,7 @@ extendIdentifier typ nm ext =
 
 -- | Split a normalized term into: a list of arguments, a list of let-bindings,
 -- and a variable reference that is the body of the let-binding. Returns a
--- String containing the error is the term was not in a normalized form.
+-- String containing the error if the term was not in a normalized form.
 splitNormalized
   :: TyConMap
   -> Term
@@ -129,13 +131,14 @@ unsafeCoreTypeToHWType'
   :: SrcSpan
   -- ^ Approximate location in original source file
   -> String
-  -> (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  -> (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -> CustomReprs
   -> TyConMap
   -> Type
-  -> HWType
+  -> State HWMap HWType
 unsafeCoreTypeToHWType' sp loc builtInTranslation reprs m ty =
-  stripFiltered (unsafeCoreTypeToHWType sp loc builtInTranslation reprs m ty)
+  stripFiltered <$> (unsafeCoreTypeToHWType sp loc builtInTranslation reprs m ty)
 
 -- | Converts a Core type to a HWType given a function that translates certain
 -- builtin types. Errors if the Core type is not translatable.
@@ -143,13 +146,14 @@ unsafeCoreTypeToHWType
   :: SrcSpan
   -- ^ Approximate location in original source file
   -> String
-  -> (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  -> (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -> CustomReprs
   -> TyConMap
   -> Type
-  -> FilteredHWType
+  -> State HWMap FilteredHWType
 unsafeCoreTypeToHWType sp loc builtInTranslation reprs m ty =
-  either (\msg -> throw (ClashException sp (loc ++ msg) Nothing)) id $
+  either (\msg -> throw (ClashException sp (loc ++ msg) Nothing)) id <$>
   coreTypeToHWType builtInTranslation reprs m ty
 
 -- | Same as @unsafeCoreTypeToHWTypeM@, but discards void filter information
@@ -165,14 +169,15 @@ unsafeCoreTypeToHWTypeM
   :: String
   -> Type
   -> NetlistMonad FilteredHWType
-unsafeCoreTypeToHWTypeM loc ty =
-  unsafeCoreTypeToHWType
-    <$> (snd <$> Lens.use curCompNm)
-    <*> pure loc
-    <*> Lens.use typeTranslator
-    <*> Lens.use customReprs
-    <*> Lens.use tcCache
-    <*> pure ty
+unsafeCoreTypeToHWTypeM loc ty = do
+  (_,cmpNm) <- Lens.use curCompNm
+  tt        <- Lens.use typeTranslator
+  reprs     <- Lens.use customReprs
+  tcm       <- Lens.use tcCache
+  htm0      <- Lens.use htyCache
+  let (hty,htm1) = runState (unsafeCoreTypeToHWType cmpNm loc tt reprs tcm ty) htm0
+  htyCache Lens..= htm1
+  return hty
 
 -- | Same as @coreTypeToHWTypeM@, but discards void filter information
 coreTypeToHWTypeM'
@@ -188,42 +193,14 @@ coreTypeToHWTypeM
   :: Type
   -- ^ Type to convert to HWType
   -> NetlistMonad (Maybe FilteredHWType)
-coreTypeToHWTypeM ty =
-  hush <$> (coreTypeToHWType <$> Lens.use typeTranslator
-                             <*> Lens.use customReprs
-                             <*> Lens.use tcCache
-                             <*> pure ty)
-
--- | Returns the name and period of the clock corresponding to a type
-synchronizedClk
-  :: TyConMap
-  -- ^ TyCon cache
-  -> Type
-  -> Maybe (Identifier,Integer)
-synchronizedClk tcm ty
-  | not . null . Lens.toListOf typeFreeVars $ ty = Nothing
-  | Just (tcNm,args) <- splitTyConAppM ty
-  = case nameOcc tcNm of
-      "Clash.Sized.Vector.Vec"       -> synchronizedClk tcm (args!!1)
-      "Clash.Signal.Internal.SClock" -> case splitTyConAppM (head args) of
-        Just (_,[LitTy (SymTy s),litTy])
-          | Right i <- runExcept (tyNatSize tcm litTy) -> Just (Text.pack s,i)
-        _ -> error $ $(curLoc) ++ "Clock period not a simple literal: " ++ showPpr ty
-      "Clash.Signal.Internal.Signal" -> case splitTyConAppM (head args) of
-        Just (_,[LitTy (SymTy s),litTy])
-          | Right i <- runExcept (tyNatSize tcm litTy) -> Just (Text.pack s,i)
-        _ -> error $ $(curLoc) ++ "Clock period not a simple literal: " ++ showPpr ty
-      _ -> case tyConDataCons (tcm `lookupUniqMap'` tcNm) of
-             [dc] -> let argTys   = dcArgTys dc
-                         argTVs   = dcUnivTyVars dc
-                         -- argSubts = zip argTVs args
-                         args'    = map (substTyWith argTVs args) argTys
-                     in case args' of
-                        (arg:_) -> synchronizedClk tcm arg
-                        _ -> Nothing
-             _    -> Nothing
-  | otherwise
-  = Nothing
+coreTypeToHWTypeM ty = do
+  tt    <- Lens.use typeTranslator
+  reprs <- Lens.use customReprs
+  tcm   <- Lens.use tcCache
+  htm0  <- Lens.use htyCache
+  let (hty,htm1) = runState (coreTypeToHWType tt reprs tcm ty) htm0
+  htyCache Lens..= htm1
+  return (hush hty)
 
 packSP
   :: CustomReprs
@@ -305,42 +282,55 @@ fixCustomRepr _ _ typ = typ
 
 -- | Same as @coreTypeToHWType@, but discards void filter information
 coreTypeToHWType'
-  :: (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  :: (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -> CustomReprs
   -> TyConMap
   -> Type
   -- ^ Type to convert to HWType
-  -> Either String HWType
+  -> State HWMap (Either String HWType)
 coreTypeToHWType' builtInTranslation reprs m ty =
-  stripFiltered <$> coreTypeToHWType builtInTranslation reprs m ty
+  fmap stripFiltered <$> coreTypeToHWType builtInTranslation reprs m ty
 
 
 -- | Converts a Core type to a HWType given a function that translates certain
 -- builtin types. Returns a string containing the error message when the Core
 -- type is not translatable.
 coreTypeToHWType
-  :: (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  :: (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -> CustomReprs
   -> TyConMap
   -> Type
   -- ^ Type to convert to HWType
-  -> Either String FilteredHWType
-coreTypeToHWType builtInTranslation reprs m ty = go' ty
-  where
-    -- Try builtin translation; for now this is hardcoded to be the one in ghcTypeToHWType
-    go' :: Type -> Either String FilteredHWType
-    go' (builtInTranslation reprs m -> Just hwtyE) =
-      (\(FilteredHWType hwty filtered) ->
-        (FilteredHWType (fixCustomRepr reprs ty hwty) filtered)) <$> hwtyE
-    -- Strip transparant types:
-    go' (coreView1 m -> Just ty') =
-      coreTypeToHWType builtInTranslation reprs m ty'
-    -- Try to create hwtype based on AST:
-    go' (tyView -> TyConApp tc args) = do
-      FilteredHWType hwty filtered <- mkADT builtInTranslation reprs m (showPpr ty) tc args
-      return (FilteredHWType (fixCustomRepr reprs ty hwty) filtered)
-    -- All methods failed:
-    go' _ = Left $ "Can't translate non-tycon type: " ++ showPpr ty
+  -> State HWMap (Either String FilteredHWType)
+coreTypeToHWType builtInTranslation reprs m ty = do
+  htyM <- HashMap.lookup ty <$> get
+  case htyM of
+    Just hty -> return hty
+    _ -> do
+      hty0M <- builtInTranslation reprs m ty
+      hty1  <- go hty0M ty
+      modify (HashMap.insert ty hty1)
+      return hty1
+ where
+  -- Try builtin translation; for now this is hardcoded to be the one in ghcTypeToHWType
+  go :: Maybe (Either String FilteredHWType)
+     -> Type
+     -> State (HashMap Type (Either String FilteredHWType))
+              (Either String FilteredHWType)
+  go (Just hwtyE) _ = pure $
+    (\(FilteredHWType hwty filtered) ->
+      (FilteredHWType (fixCustomRepr reprs ty hwty) filtered)) <$> hwtyE
+  -- Strip transparant types:
+  go _ (coreView1 m -> Just ty') =
+    coreTypeToHWType builtInTranslation reprs m ty'
+  -- Try to create hwtype based on AST:
+  go _ (tyView -> TyConApp tc args) = runExceptT $ do
+    FilteredHWType hwty filtered <- mkADT builtInTranslation reprs m (showPpr ty) tc args
+    return (FilteredHWType (fixCustomRepr reprs ty hwty) filtered)
+  -- All methods failed:
+  go _ _ = return $ Left $ "Can't translate non-tycon type: " ++ showPpr ty
 
 -- | Generates original indices in list before filtering, given a list of
 -- removed indices.
@@ -357,7 +347,8 @@ originalIndices wereVoids =
 
 -- | Converts an algebraic Core type (split into a TyCon and its argument) to a HWType.
 mkADT
-  :: (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  :: (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -- ^ Hardcoded Type -> HWType translator
   -> CustomReprs
   -> TyConMap
@@ -368,19 +359,19 @@ mkADT
   -- ^ The TyCon
   -> [Type]
   -- ^ Its applied arguments
-  -> Either String FilteredHWType
+  -> ExceptT String (State HWMap) FilteredHWType
   -- ^ An error string or a tuple with the type and possibly a list of
   -- removed arguments.
 mkADT _ _ m tyString tc _
   | isRecursiveTy m tc
-  = Left $ $(curLoc) ++ "Can't translate recursive type: " ++ tyString
+  = throwE $ $(curLoc) ++ "Can't translate recursive type: " ++ tyString
 
 mkADT builtInTranslation reprs m _tyString tc args = case tyConDataCons (m `lookupUniqMap'` tc) of
   []  -> return (FilteredHWType (Void Nothing) [])
   dcs -> do
     let tcName           = nameOcc tc
-        substArgTyss     = map substArgTys dcs
-    argHTyss0           <- mapM (mapM (coreTypeToHWType builtInTranslation reprs m)) substArgTyss
+        substArgTyss     = map (`substArgTys` args) dcs
+    argHTyss0           <- mapM (mapM (ExceptT . coreTypeToHWType builtInTranslation reprs m)) substArgTyss
     let argHTyss1        = map (\tys -> zip (map isFilteredVoid tys) tys) argHTyss0
     let areVoids         = map (map fst) argHTyss1
     let filteredArgHTyss = map (map snd . filter (not . fst)) argHTyss1
@@ -449,17 +440,6 @@ mkADT builtInTranslation reprs m _tyString tc args = case tyConDataCons (m `look
         return $ FilteredHWType (SP tcName $ zipWith
           (\dc tys ->  ( nameOcc (dcName dc), tys))
           dcs (map stripFiltered <$> elemHTys)) argHTyss1
- where
-  argsFVs = List.foldl' unionVarSet emptyVarSet
-                (map (Lens.foldMapOf typeFreeVars unitVarSet) args)
-
-  substArgTys dc =
-    let univTVs = dcUnivTyVars dc
-        extTVs  = dcExtTyVars dc
-        is      = mkInScopeSet (argsFVs `unionVarSet` mkVarSet extTVs)
-        -- See Note [The substitution invariant]
-        subst   = extendTvSubstList (mkSubst is) (univTVs `zipEqual` args)
-    in  map (substTy subst) (dcArgTys dc)
 
 -- | Simple check if a TyCon is recursively defined.
 isRecursiveTy :: TyConMap -> TyConName -> Bool
@@ -472,7 +452,8 @@ isRecursiveTy m tc = case tyConDataCons (m `lookupUniqMap'` tc) of
 -- | Determines if a Core type is translatable to a HWType given a function that
 -- translates certain builtin types.
 representableType
-  :: (CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType))
+  :: (CustomReprs -> TyConMap -> Type ->
+      State HWMap (Maybe (Either String FilteredHWType)))
   -> CustomReprs
   -> Bool
   -- ^ String considered representable
@@ -480,7 +461,9 @@ representableType
   -> Type
   -> Bool
 representableType builtInTranslation reprs stringRepresentable m =
-    either (const False) isRepresentable . coreTypeToHWType' builtInTranslation reprs m
+    either (const False) isRepresentable .
+    flip evalState HashMap.empty .
+    coreTypeToHWType' builtInTranslation reprs m
   where
     isRepresentable hty = case hty of
       String            -> stringRepresentable
@@ -499,10 +482,10 @@ typeSize :: HWType
 typeSize (Void {}) = 0
 typeSize String = 0
 typeSize Integer = 0
+typeSize (KnownDomain {}) = 0
 typeSize Bool = 1
 typeSize Bit = 1
-typeSize (Clock _ _ Source) = 1
-typeSize (Clock _ _ Gated)  = 2
+typeSize (Clock _) = 1
 typeSize (Reset {}) = 1
 typeSize (BitVector i) = i
 typeSize (Index 0) = 0
@@ -617,7 +600,8 @@ filterVoidPorts filtered pp@(PortProduct _s _ps) =
 -- | Uniquely rename all the variables and their references in a normalized
 -- term
 mkUniqueNormalized
-  :: Maybe (Maybe TopEntity)
+  :: InScopeSet
+  -> Maybe (Maybe TopEntity)
   -- ^ Top entity annotation where:
   --
   --     * Nothing: term is not a top entity
@@ -635,7 +619,7 @@ mkUniqueNormalized
       ,[Declaration]
       ,[LetBinding]
       ,Maybe Id)
-mkUniqueNormalized topMM (args,binds,res) = do
+mkUniqueNormalized is0 topMM (args,binds,res) = do
   -- Add user define port names to list of seen ids to prevent name collisions.
   let
     portNames =
@@ -648,8 +632,8 @@ mkUniqueNormalized topMM (args,binds,res) = do
   let (bndrs,exprs) = unzip binds
 
   -- Make arguments unique
-  is0 <- (`extendInScopeSetList` (args ++ bndrs)) <$> Lens.use globalInScope
-  (wereVoids, iports,iwrappers,substArgs) <- mkUniqueArguments (mkSubst is0) topMM args
+  let is1 = is0 `extendInScopeSetList` (args ++ bndrs)
+  (wereVoids, iports,iwrappers,substArgs) <- mkUniqueArguments (mkSubst is1) topMM args
 
   -- Make result unique. This might yield 'Nothing' in which case the result
   -- was a single BiSignalOut. This is superfluous in the HDL, as the argument
@@ -658,7 +642,7 @@ mkUniqueNormalized topMM (args,binds,res) = do
   case resM of
     Just (oports,owrappers,res1,substRes) -> do
       let usesOutput = concatMap (filter ( == res)
-                                         . Lens.toListOf termFreeIds
+                                         . Lens.toListOf freeLocalIds
                                          ) exprs
       -- If the let-binder carrying the result is used in a feedback loop
       -- rename the let-binder to "<X>_rec", and assign the "<X>_rec" to
@@ -717,17 +701,13 @@ mkUniqueArguments subst0 (Just teM) args = do
                                (map fst subst))
   where
     go pM var = do
-      tcm       <- Lens.use tcCache
-      typeTrans <- Lens.use typeTranslator
-      reprs     <- Lens.use customReprs
-      (_,sp)    <- Lens.use curCompNm
       let i     = varName var
           i'    = nameOcc i
           ty    = varType var
-          fHwty = unsafeCoreTypeToHWType sp $(curLoc) typeTrans reprs tcm ty
-          FilteredHWType hwty _ = fHwty
+      fHwty <- unsafeCoreTypeToHWTypeM $(curLoc) ty
+      let FilteredHWType hwty _ = fHwty
       (ports,decls,_,pN) <- mkInput (filterVoidPorts fHwty <$> pM) (i',hwty)
-      let pId  = mkId ty (repName pN i)
+      let pId  = mkLocalId ty (repName pN i)
       if isVoid hwty
          then return Nothing
          else return (Just (ports,decls,(pId,(var,Var pId))))
@@ -751,15 +731,12 @@ mkUniqueResult subst0 Nothing res = do
     _         -> return Nothing
 
 mkUniqueResult subst0 (Just teM) res = do
-  tcm       <- Lens.use tcCache
-  typeTrans <- Lens.use typeTranslator
-  reprs     <- Lens.use customReprs
   (_,sp)    <- Lens.use curCompNm
   let o     = varName res
       o'    = nameOcc o
       ty    = varType res
-      fHwty = unsafeCoreTypeToHWType sp $(curLoc) typeTrans reprs tcm ty
-      FilteredHWType hwty _ = fHwty
+  fHwty <- unsafeCoreTypeToHWTypeM $(curLoc) ty
+  let FilteredHWType hwty _ = fHwty
       oPortSupply = fmap t_output teM
   when (containsBiSignalIn hwty)
     (throw (ClashException sp ($(curLoc) ++ "BiSignalIn cannot be part of a function's result. Use 'readFromBiSignal'.") Nothing))
@@ -767,7 +744,7 @@ mkUniqueResult subst0 (Just teM) res = do
   case output of
     Just (ports, decls, pN) -> do
       let pO = repName pN o
-          pOId = mkId ty pO
+          pOId = mkLocalId ty pO
           subst1 = extendInScopeId (extendIdSubst subst0 res (Var pOId)) pOId
       return (Just (ports,decls,pOId,subst1))
     _ -> return Nothing
@@ -800,13 +777,9 @@ idToOutPort var = do
 
 idToPort :: Id -> NetlistMonad (Maybe (Identifier,HWType))
 idToPort var = do
-  tcm <- Lens.use tcCache
-  typeTrans <- Lens.use typeTranslator
-  (_,sp) <- Lens.use curCompNm
-  reprs <- Lens.use customReprs
   let i  = varName var
       ty = varType var
-      hwTy = unsafeCoreTypeToHWType' sp $(curLoc) typeTrans reprs tcm ty
+  hwTy <- unsafeCoreTypeToHWTypeM' $(curLoc) ty
   if isVoid hwTy
     then return Nothing
     else return (Just (nameOcc i, hwTy))
@@ -833,7 +806,7 @@ mkUnique = go []
   where
     go :: [Id] -> Subst -> [Id] -> NetlistMonad ([Id],Subst)
     go processed subst []     = return (reverse processed,subst)
-    go processed subst@(Subst isN _ _) (i:is) = do
+    go processed subst@(Subst isN _ _ _) (i:is) = do
       iN <- mkUniqueIdentifier Extended (id2identifier i)
       let i' = uniqAway isN (modifyVarName (repName iN) i)
           subst' = extendInScopeId (extendIdSubst subst i (Var i')) i'
@@ -863,9 +836,13 @@ mkUniqueIdentifier typ nm = do
       Just _  -> go (n+1) g i
       Nothing -> do
         seenIds %= HashMap.insert i (n+1)
+        -- Don't forget to add the extended ID to the list of seen identifiers,
+        -- in case we want to create a new identifier based on the extended ID
+        -- we return in this function
+        seenIds %= HashMap.insert i' 0
         return i'
 
--- | Preserve the Netlist '_varEnv' and '_varCount' when executing a monadic action
+-- | Preserve the Netlist '_varCount','_curCompNm','_seenIds' when executing a monadic action
 preserveVarEnv :: NetlistMonad a
                -> NetlistMonad a
 preserveVarEnv action = do
@@ -983,14 +960,6 @@ mkInput pM = case pM of
                   else
                     throwAnnotatedSplitError $(curLoc) "Product"
 
-        Clock _ _ Gated -> do
-          arguments <- splitGatedClock i' hwty
-          (ports,_,exprs,_) <- unzip4 <$> mapM (mkInput Nothing) arguments
-          let netdecl  = NetDecl Nothing i' hwty
-              dcExpr   = DataCon hwty (DC (hwty,0)) exprs
-              netassgn = Assignment i' dcExpr
-          return (concat ports,[netdecl,netassgn],dcExpr,i')
-
         _ -> return ([(i',hwty)],[],Identifier i' Nothing,i')
 
 
@@ -1056,14 +1025,6 @@ mkInput pM = case pM of
                   netassgn = Assignment pN dcExpr
               return (concat ports,[netdecl,netassgn],dcExpr,pN)
             _ -> error "Unexpected error for PortProduct"
-
-        Clock _ _ Gated -> do
-          arguments <- splitGatedClock pN hwty
-          (ports,_,exprs,_) <- unzip4 <$> zipWithM mkInput (extendPorts $ map (prefixParent p) ps) arguments
-          let netdecl  = NetDecl Nothing pN hwty
-              dcExpr   = DataCon hwty (DC (hwty,0)) exprs
-              netassgn = Assignment pN dcExpr
-          return (concat ports,[netdecl,netassgn],dcExpr,pN)
 
         _ ->  return ([(pN,hwty)],[],Identifier pN Nothing,pN)
 
@@ -1201,13 +1162,6 @@ mkOutput' pM = case pM of
                   else
                     throwAnnotatedSplitError $(curLoc) "Product"
 
-        Clock _ _ Gated -> do
-          results <- splitGatedClock o' hwty
-          (ports,decls,ids) <- unzip3 <$> mapM (mkOutput' Nothing) results
-          let netdecl = NetDecl Nothing o' hwty
-              assigns = zipWith (assignId o' hwty 0) ids [0..]
-          return (concat ports,netdecl:assigns ++ concat decls,o')
-
         _ -> return ([(o',hwty)],[],o')
 
     go' (PortName p) (o,hwty) = do
@@ -1274,14 +1228,6 @@ mkOutput' pM = case pM of
               in  return (concat ports,netdecl:assigns ++ concat decls,pN)
             _ -> error "Unexpected error for PortProduct"
 
-        Clock _ _ Gated -> do
-          results <- splitGatedClock pN hwty
-          let resultsBundled   = (extendPorts $ map (prefixParent p) ps, results)
-          (ports,decls,ids) <- unzip3 <$> uncurry (zipWithM mkOutput') resultsBundled
-          let netdecl = NetDecl Nothing pN hwty
-              assigns = zipWith (assignId pN hwty 0) ids [0..]
-          return (concat ports,netdecl:assigns ++ concat decls,pN)
-
         _ -> return ([(pN,hwty)],[],pN)
 
     assignId p hwty con i n =
@@ -1341,13 +1287,14 @@ mkTopUnWrapper topEntity annM man dstId args = do
   (iResult ++) <$> case topOutputM of
     Nothing -> return []
     Just (_, (oports, unwrappers, idsO)) -> do
-        instLabel <- extendIdentifier Basic topName ("_" `Text.append` fst dstId)
+        instLabel0 <- extendIdentifier Basic topName ("_" `Text.append` fst dstId)
+        instLabel1 <- mkUniqueIdentifier Basic instLabel0
         let outpAssign = Assignment (fst dstId) (resBV topM idsO)
         let topCompDecl = InstDecl
                             Entity
                             (Just topName)
                             topName
-                            instLabel
+                            instLabel1
                             []
                             ( map (\(p,i,t) -> (Identifier p Nothing,In, t,Identifier i Nothing)) (concat iports) ++
                               map (\(p,o,t) -> (Identifier p Nothing,Out,t,Identifier o Nothing)) oports)
@@ -1409,7 +1356,6 @@ doConv hwty (Just topM) b e = case hwty of
   Vector  {} -> ConvBV topM hwty b e
   RTree   {} -> ConvBV topM hwty b e
   Product {} -> ConvBV topM hwty b e
-  Clock _ _ Gated -> ConvBV topM hwty b e
   _          -> e
 
 -- | Generate input port mappings for the TopEntity
@@ -1470,15 +1416,6 @@ mkTopInput topM inps pM = case pM of
             return (inps'',(concat ports,iDecl:assigns++concat decls,Left i'))
           else
             throwAnnotatedSplitError $(curLoc) "Product"
-
-        Clock _ _ Gated -> do
-          arguments <- splitGatedClock i' hwty
-          (inps'',arguments1) <- mapAccumLM go inps' arguments
-          let (ports,decls,ids) = unzip3 arguments1
-              assigns = zipWith (argBV topM) ids
-                          [ Identifier i' (Just (Indexed (hwty,0,n)))
-                          | n <- [0..]]
-          return (inps'',(concat ports,iDecl:assigns++concat decls,Left i'))
 
         _ -> return (rest,([(iN,i',hwty)],[iDecl],Left i'))
 
@@ -1564,17 +1501,6 @@ mkTopInput topM inps pM = case pM of
                             ]
               return (inps'',(concat ports,pDecl:assigns ++ concat decls,Left pN'))
             _ -> error "Unexpected error for PortProduct"
-
-        Clock _ _ Gated -> do
-          arguments <- splitGatedClock pN' hwty
-          (inps'',arguments1) <-
-            mapAccumLM (\acc (p',o') -> mkTopInput topM acc p' o') inps'
-                       (zip (extendPorts ps) arguments)
-          let (ports,decls,ids) = unzip3 arguments1
-              assigns = zipWith (argBV topM) ids
-                          [ Identifier pN' (Just (Indexed (hwty,0,n)))
-                          | n <- [0..]]
-          return (inps'',(concat ports,pDecl:assigns ++ concat decls,Left pN'))
 
         _ -> return (tail inps',([(pN,pN',hwty)],[pDecl],Left pN'))
 
@@ -1682,17 +1608,6 @@ mkTopOutput' topM outps pM = case pM of
           else
             throwAnnotatedSplitError $(curLoc) "Product"
 
-        Clock _ _ Gated -> do
-          results <- splitGatedClock o' hwty
-          (outps'',results1) <- mapAccumLM go outps' results
-          let (ports,decls,ids) = unzip3 results1
-              ids' = map (resBV topM) ids
-              netassgn = Assignment o' (DataCon hwty (DC (hwty,0)) ids')
-          if null attrs then
-            return (outps'', (concat ports,oDecl:netassgn:concat decls,Left o'))
-          else
-            throwAnnotatedSplitError $(curLoc) $ show hwty
-
         _ -> return (rest,([(oN,o',hwty)],[oDecl],Left o'))
 
     go [] _ = error "This shouldn't happen"
@@ -1766,17 +1681,6 @@ mkTopOutput' topM outps pM = case pM of
               netassgn = Assignment pN' (DataCon hwty (DC (BitVector (typeSize hwty),0)) ids2)
           return (outps'',(concat ports,pDecl:netassgn:concat decls,Left pN'))
 
-        Clock _ _ Gated -> do
-          results <- splitGatedClock pN hwty
-          (outps'',results1) <- mapAccumLM go outps' results
-          let (ports,decls,ids) = unzip3 results1
-              ids' = map (resBV topM) ids
-              netassgn = Assignment pN' (DataCon hwty (DC (hwty,0)) ids')
-          if null attrs then
-            return (outps'', (concat ports,pDecl:netassgn:concat decls,Left pN'))
-          else
-            throwAnnotatedSplitError $(curLoc) $ show hwty
-
         _ -> return (tail outps',([(pN,pN',hwty)],[pDecl],Left pN'))
 
 concatPortDecls3
@@ -1835,15 +1739,6 @@ nestM (Indexed (RTree (-1) t1,l,_)) (Indexed (RTree d t2,10,k))
 nestM _ _ = Nothing
 
 
-splitGatedClock :: Identifier -> HWType -> NetlistMonad [(Identifier,HWType)]
-splitGatedClock baseNm (Clock nm rt Gated) = do
-  hwnms <- mapM (extendIdentifier Basic baseNm) partNms
-  return $ zip hwnms hwtys
-  where
-    hwtys = [Clock nm rt Source,Bool]
-    partNms = ["_clk","_clken"]
-splitGatedClock _ ty = error $ $(curLoc) ++ "splitGatedClock can't split: " ++ show ty
-
 -- | Determines if any type variables (exts) are bound in any of the given
 -- type or term variables (tms). It's currently only used to detect bound
 -- existentials, hence the name.
@@ -1854,3 +1749,31 @@ bindsExistentials
 bindsExistentials exts tms = any (`elem` freeVars) exts
  where
   freeVars = concatMap (Lens.toListOf typeFreeVars) (map varType tms)
+
+iteAlts :: HWType -> [Alt] -> Maybe (Term,Term)
+iteAlts sHTy [(pat0,alt0),(pat1,alt1)] | validIteSTy sHTy = case pat0 of
+  DataPat dc _ _ -> case dcTag dc of
+    2 -> Just (alt0,alt1)
+    _ -> Just (alt1,alt0)
+  LitPat (C.IntegerLiteral l) -> case l of
+    1 -> Just (alt0,alt1)
+    _ -> Just (alt1,alt0)
+  DefaultPat -> case pat1 of
+    DataPat dc _ _ -> case dcTag dc of
+      2 -> Just (alt1,alt0)
+      _ -> Just (alt0,alt1)
+    LitPat (C.IntegerLiteral l) -> case l of
+      1 -> Just (alt1,alt0)
+      _ -> Just (alt0,alt1)
+    _ -> Nothing
+  _ -> Nothing
+ where
+  validIteSTy Bool          = True
+  validIteSTy Bit           = True
+  validIteSTy (Sum _ [_,_]) = True
+  validIteSTy (SP _ [_,_])  = True
+  validIteSTy (Unsigned 1)  = True
+  validIteSTy (Index 2)     = True
+  validIteSTy _             = False
+
+iteAlts _ _ = Nothing

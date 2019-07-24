@@ -51,7 +51,7 @@ module Clash.Sized.Fixed
   , divide
     -- * Compile-time 'Double' conversion
   , fLit
-    -- * Run-time 'Double' conversion (not synthesisable)
+    -- * Run-time 'Double' conversion (not synthesizable)
   , fLitR
     -- * 'Fixed' point wrapper
   , Fixed (..), resizeF, fracShift
@@ -74,6 +74,7 @@ import Control.Arrow              ((***), second)
 import Data.Bits                  (Bits (..), FiniteBits)
 import Data.Data                  (Data)
 import Data.Default.Class         (Default (..))
+import Data.Either                (isLeft)
 import Text.Read                  (Read(..))
 import Data.List                  (find)
 import Data.Maybe                 (fromJust)
@@ -98,7 +99,8 @@ import Clash.Prelude.BitReduction (reduceAnd, reduceOr)
 import Clash.Sized.BitVector      (BitVector, (++#))
 import Clash.Sized.Signed         (Signed)
 import Clash.Sized.Unsigned       (Unsigned)
-import Clash.XException           (ShowX (..), Undefined (..), errorX, showsPrecXWith)
+import Clash.XException
+  (ShowX (..), Undefined (..), isX, errorX, showsPrecXWith)
 
 {- $setup
 >>> :set -XDataKinds
@@ -205,9 +207,12 @@ type UFixed = Fixed Unsigned
 --
 -- >>> sf d4 (-22 :: Signed 7)
 -- -1.375
-sf :: SNat frac           -- ^ Position of the virtual @point@
-   -> Signed (int + frac) -- ^ The 'Signed' integer
-   -> SFixed int frac
+sf
+  :: SNat frac
+  -- ^ Position of the virtual @point@
+  -> Signed (int + frac)
+  -- ^ The 'Signed' integer
+  -> SFixed int frac
 sf _ fRep = Fixed fRep
 
 {-# INLINE unSF #-}
@@ -221,9 +226,12 @@ unSF (Fixed fRep) = fRep
 --
 -- >>> uf d4 (92 :: Unsigned 7)
 -- 5.75
-uf :: SNat frac             -- ^ Position of the virtual @point@
-   -> Unsigned (int + frac) -- ^ The 'Unsigned' integer
-   -> UFixed int frac
+uf
+  :: SNat frac
+  -- ^ Position of the virtual @point@
+  -> Unsigned (int + frac)
+  -- ^ The 'Unsigned' integer
+  -> UFixed int frac
 uf _ fRep = Fixed fRep
 
 {-# INLINE unUF #-}
@@ -268,9 +276,11 @@ instance ( size ~ (int + frac), KnownNat frac, Integral (rep size)
          ) => ShowX (Fixed rep int frac) where
   showsPrecX = showsPrecXWith showsPrec
 
-instance Undefined (Fixed rep int frac) where deepErrorX = Fixed . errorX
+instance Undefined (rep (int + frac)) => Undefined (Fixed rep int frac) where
+  deepErrorX = Fixed . errorX
+  rnfX f@(~(Fixed x)) = if isLeft (isX f) then () else rnfX x
 
--- | None of the 'Read' class' methods are synthesisable.
+-- | None of the 'Read' class' methods are synthesizable.
 instance (size ~ (int + frac), KnownNat frac, Bounded (rep size), Integral (rep size))
       => Read (Fixed rep int frac) where
   readPrec = fLitR <$> readPrec
@@ -545,9 +555,11 @@ type ResizeUFC int1 frac1 int2 frac2 =
 --
 -- * @'ResizeUFC' rep int1 frac1 int2 frac2@ for:
 --   @'UFixed' int1 frac1 -> 'UFixed' int2 frac2@
-resizeF :: forall rep int1 frac1 int2 frac2 . ResizeFC rep int1 frac1 int2 frac2
-        => Fixed rep int1 frac1
-        -> Fixed rep int2 frac2
+resizeF
+  :: forall rep int1 frac1 int2 frac2
+   . ResizeFC rep int1 frac1 int2 frac2
+  => Fixed rep int1 frac1
+  -> Fixed rep int2 frac2
 resizeF (Fixed fRep) = Fixed sat
   where
     fMin  = minBound :: rep (int2 + frac2)
@@ -625,11 +637,14 @@ resizeF (Fixed fRep) = Fixed sat
 -- 0.1953125
 -- >>> $$(fLit (atan 0.2)) :: SFixed 1 20
 -- 0.19739532470703125
-fLit :: forall rep int frac size .
-        ( size ~ (int + frac), KnownNat frac, Bounded (rep size)
-        , Integral (rep size))
-     => Double
-     -> Q (TExp (Fixed rep int frac))
+fLit
+  :: forall rep int frac size
+   . ( size ~ (int + frac)
+     , KnownNat frac
+     , Bounded (rep size)
+     , Integral (rep size) )
+  => Double
+  -> Q (TExp (Fixed rep int frac))
 fLit a = [|| Fixed (fromInteger sat) ||]
   where
     rMax      = toInteger (maxBound :: rep size)
@@ -644,13 +659,13 @@ fLit a = [|| Fixed (fromInteger sat) ||]
 
 -- | Convert, at run-time, a 'Double' to a 'Fixed'-point.
 --
--- __NB__: this functions is /not/ synthesisable
+-- __NB__: this functions is /not/ synthesizable
 --
 -- = Creating data-files #creatingdatafiles#
 --
 -- An example usage of this function is for example to convert a data file
 -- containing 'Double's to a data file with ASCI-encoded binary numbers to be
--- used by a synthesisable function like 'Clash.Prelude.ROM.File.asyncRomFile'.
+-- used by a synthesizable function like 'Clash.Prelude.ROM.File.asyncRomFile'.
 -- For example, given a file @Data.txt@ containing:
 --
 -- @
@@ -671,8 +686,12 @@ fLit a = [|| Fixed (fromInteger sat) ||]
 -- import System.Environment
 -- import qualified Data.List as L
 --
--- createRomFile :: KnownNat n => (Double -> BitVector n)
---               -> FilePath -> FilePath -> IO ()
+-- createRomFile
+--   :: KnownNat n
+--   => (Double -> BitVector n)
+--   -> FilePath
+--   -> FilePath
+--   -> IO ()
 -- createRomFile convert fileR fileW = do
 --   f <- readFile fileR
 --   let ds :: [Double]
@@ -790,11 +809,14 @@ fLit a = [|| Fixed (fromInteger sat) ||]
 -- __>>> romF' 0 0__
 -- 1.19921875
 -- @
-fLitR :: forall rep int frac size .
-         ( size ~ (int + frac), KnownNat frac, Bounded (rep size)
-         , Integral (rep size))
-      => Double
-      -> Fixed rep int frac
+fLitR
+  :: forall rep int frac size
+   . ( size ~ (int + frac)
+     , KnownNat frac
+     , Bounded (rep size)
+     , Integral (rep size))
+  => Double
+  -> Fixed rep int frac
 fLitR a = Fixed (fromInteger sat)
   where
     rMax      = toInteger (maxBound :: rep size)
@@ -900,10 +922,11 @@ type DivideUC int1 frac1 int2 frac2 =
 --
 -- * @'DivideUC' rep int1 frac1 int2 frac2@ for:
 --   @'UFixed' int1 frac1 -> 'UFixed' int2 frac2 -> 'UFixed' (int1 + frac2 + 1) (int2 + frac1)@
-divide :: DivideC rep int1 frac1 int2 frac2
-       => Fixed rep int1 frac1
-       -> Fixed rep int2 frac2
-       -> Fixed rep (int1 + frac2 + 1) (int2 + frac1)
+divide
+  :: DivideC rep int1 frac1 int2 frac2
+  => Fixed rep int1 frac1
+  -> Fixed rep int2 frac2
+  -> Fixed rep (int1 + frac2 + 1) (int2 + frac1)
 divide (Fixed fr1) fx2@(Fixed fr2) =
   let int2  = fromInteger (natVal (asIntProxy fx2))
       frac2 = fromInteger (natVal fx2)

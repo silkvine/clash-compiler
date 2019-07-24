@@ -47,20 +47,21 @@ import           Util                          (OverridingBool(..))
 import           Clash.Annotations.Primitive
   (PrimitiveGuard(HasBlackBox, WarnNonSynthesizable, WarnAlways, DontTranslate))
 import           Clash.Core.DataCon            as D (dcTag)
-import           Clash.Core.FreeVars           (termFreeIds)
+import           Clash.Core.FreeVars           (freeIds)
 import           Clash.Core.Literal            as L (Literal (..))
 import           Clash.Core.Name
   (Name (..), mkUnsafeSystemName)
 import           Clash.Core.Pretty             (showPpr)
 import           Clash.Core.Subst              (extendIdSubst, mkSubst, substTm)
-import           Clash.Core.Term               as C (Term (..))
+import           Clash.Core.Term               as C (Term (..), collectArgs)
 import           Clash.Core.Type               as C (Type (..), ConstTy (..),
                                                 splitFunTys)
 import           Clash.Core.TyCon              as C (tyConDataCons)
-import           Clash.Core.Util               (collectArgs, isFun, termType)
-import           Clash.Core.Var                as V (Id, Var (..), mkId, modifyVarName)
+import           Clash.Core.Util               (isFun, termType)
+import           Clash.Core.Var                as V
+  (Id, Var (..), mkLocalId, modifyVarName)
 import           Clash.Core.VarEnv
-  (extendInScopeSet, mkInScopeSet, lookupVarEnv, unionInScope, uniqAway, unitVarSet)
+  (extendInScopeSet, mkInScopeSet, lookupVarEnv, uniqAway, unitVarSet)
 import {-# SOURCE #-} Clash.Netlist
   (genComponent, mkDcApplication, mkDeclarations, mkExpr, mkNetDecl,
    mkProjection, mkSelection, mkFunApp)
@@ -97,12 +98,14 @@ warn opts msg = do
 
 -- | Generate the context for a BlackBox instantiation.
 mkBlackBoxContext
-  :: Id
+  :: TextS.Text
+  -- ^ Blackbox function name
+  -> Id
   -- ^ Identifier binding the primitive/blackbox application
   -> [Term]
   -- ^ Arguments of the primitive/blackbox application
   -> NetlistMonad (BlackBoxContext,[Declaration])
-mkBlackBoxContext resId args = do
+mkBlackBoxContext bbName resId args = do
     -- Make context inputs
     tcm             <- Lens.use tcCache
     let resNm = nameOcc (varName resId)
@@ -116,7 +119,7 @@ mkBlackBoxContext resId args = do
     lvl <- Lens.use curBBlvl
     (nm,_) <- Lens.use curCompNm
 
-    return ( Context (res,resTy) imps funs [] lvl nm
+    return ( Context bbName (res,resTy) imps funs [] lvl nm
            , concat impDecls ++ concat funDecls
            )
   where
@@ -205,7 +208,7 @@ mkArgument bndr e = do
                   ,hwTy,False),[])
     return ((e',t,l),d)
 
--- | Extract a compiled primitive from a gaurded primtive. Emit a warning if
+-- | Extract a compiled primitive from a guarded primitive. Emit a warning if
 -- the guard wants to, or fail entirely.
 extractPrimWarnOrFail
   :: TextS.Text
@@ -247,7 +250,9 @@ extractPrimWarnOrFail nm = do
     when (primWarn && not seen)
       $ liftIO
       $ warn opts
-      $ "Dubious primitive instantiation: "
+      $ "Dubious primitive instantiation for "
+     ++ unpack nm
+     ++ ": "
      ++ warning
      ++ " (disable with -fclash-no-prim-warn)"
 
@@ -282,8 +287,9 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
       -> NetlistMonad (Expr, [Declaration])
     go =
       \case
-        P.BlackBoxHaskell bbName funcName (_fHash, func) ->
-          case func bbEasD dst nm args ty of
+        P.BlackBoxHaskell bbName wf funcName (_fHash, func) -> do
+          bbFunRes <- func bbEasD dst nm args ty
+          case bbFunRes of
             Left err -> do
               -- Blackbox template function returned an error:
               let err' = unwords [ $(curLoc) ++ "Could not create blackbox"
@@ -295,7 +301,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
             Right (BlackBoxMeta {..}, bbTemplate) ->
               -- Blackbox template generation succesful. Rerun 'go', but this time
               -- around with a 'normal' @BlackBox@
-              go (P.BlackBox bbName bbKind () bbOutputReg bbLibrary bbImports bbIncludes bbTemplate)
+              go (P.BlackBox bbName wf bbKind () bbOutputReg bbLibrary bbImports bbIncludes bbTemplate)
         p@P.BlackBox {outputReg = wr} ->
           case kind p of
             TDecl -> do
@@ -305,7 +311,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
               resM <- resBndr True wr' dst
               case resM of
                 Just (dst',dstNm,dstDecl) -> do
-                  (bbCtx,ctxDcls)   <- mkBlackBoxContext dst' (lefts args)
+                  (bbCtx,ctxDcls)   <- mkBlackBoxContext nm dst' (lefts args)
                   (templ,templDecl) <- prepareBlackBox pNm tempD bbCtx
                   let bbDecl = N.BlackBoxD pNm (libraries p) (imports p)
                                            (includes p) templ bbCtx
@@ -319,7 +325,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
                   resM <- resBndr True Wire dst
                   case resM of
                     Just (dst',dstNm,dstDecl) -> do
-                      (bbCtx,ctxDcls)     <- mkBlackBoxContext dst' (lefts args)
+                      (bbCtx,ctxDcls)     <- mkBlackBoxContext nm dst' (lefts args)
                       (bbTempl,templDecl) <- prepareBlackBox pNm tempE bbCtx
                       let tmpAssgn = Assignment dstNm
                                         (BlackBoxE pNm (libraries p) (imports p)
@@ -331,7 +337,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
                   resM <- resBndr False Wire dst
                   case resM of
                     Just (dst',_,_) -> do
-                      (bbCtx,ctxDcls)      <- mkBlackBoxContext dst' (lefts args)
+                      (bbCtx,ctxDcls)      <- mkBlackBoxContext nm dst' (lefts args)
                       (bbTempl,templDecl0) <- prepareBlackBox pNm tempE bbCtx
                       let templDecl1 = case nm of
                             "Clash.Sized.Internal.BitVector.fromInteger#"
@@ -347,7 +353,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
                             _ -> templDecl0
                       return (BlackBoxE pNm (libraries p) (imports p) (includes p) bbTempl bbCtx bbEParen,ctxDcls ++ templDecl1)
                     Nothing -> return (Identifier "__VOID__" Nothing,[])
-        P.Primitive pNm _
+        P.Primitive pNm _ _
           | pNm == "GHC.Prim.tagToEnum#" -> do
               hwTy <- N.unsafeCoreTypeToHWTypeM' $(curLoc) ty
               case args of
@@ -390,7 +396,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
           | otherwise ->
               return (BlackBoxE "" [] [] []
                         (BBTemplate [Text $ mconcat ["NO_TRANSLATION_FOR:",fromStrict pNm]])
-                        emptyBBContext False,[])
+                        (emptyBBContext pNm) False,[])
 
     resBndr
       :: Bool
@@ -403,7 +409,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
         False -> do
           -- TODO: check that it's okay to use `mkUnsafeSystemName`
           let nm' = mkUnsafeSystemName dstL 0
-              id_ = mkId ty nm'
+              id_ = mkLocalId ty nm'
           return (Just (id_,dstL,[]))
         True -> do
           nm'  <- extendIdentifier Extended dstL "_res"
@@ -411,7 +417,7 @@ mkPrimitive bbEParen bbEasD dst nm args ty =
           -- TODO: check that it's okay to use `mkUnsafeInternalName`
           let nm3 = mkUnsafeSystemName nm'' 0
           hwTy <- N.unsafeCoreTypeToHWTypeM' $(curLoc) ty
-          let id_    = mkId ty nm3
+          let id_    = mkLocalId ty nm3
               idDecl = NetDecl' Nothing wr nm'' (Right hwTy)
           case hwTy of
             Void {} -> return Nothing
@@ -439,7 +445,7 @@ mkFunInput resId e = do
   -- TODO: Rewrite this function to use blackbox functions. Right now it
   -- TODO: generates strings that are later parsed/interpreted again. Silly!
   let (appE,args) = collectArgs e
-  (bbCtx,dcls) <- mkBlackBoxContext resId (lefts args)
+  (bbCtx,dcls) <- mkBlackBoxContext "__INTERNAL__" resId (lefts args)
   templ <- case appE of
             Prim nm _ -> do
               bb  <- extractPrimWarnOrFail nm
@@ -448,11 +454,11 @@ mkFunInput resId e = do
                   case bb of
                     P.BlackBox {..} ->
                       Left (kind,outputReg,libraries,imports,includes,nm,template)
-                    P.Primitive pn pt ->
+                    P.Primitive pn _ pt ->
                       error $ $(curLoc) ++ "Unexpected blackbox type: "
                                         ++ "Primitive " ++ show pn
                                         ++ " " ++ show pt
-                    P.BlackBoxHaskell pnm fn _ ->
+                    P.BlackBoxHaskell pnm _ fn _ ->
                       error $ $(curLoc) ++ "Unexpected blackbox type: "
                                         ++ "BlackBoxHaskell" ++ show pnm
                                         ++ " " ++ show fn ++ " <func>"
@@ -561,7 +567,7 @@ mkFunInput resId e = do
                       return (Right (("",[instDecl]),Wire))
                     Nothing -> error $ $(curLoc) ++ "Cannot make function input for: " ++ showPpr e
             C.Lam {} -> do
-              let is0 = mkInScopeSet (Lens.foldMapOf termFreeIds unitVarSet appE)
+              let is0 = mkInScopeSet (Lens.foldMapOf freeIds unitVarSet appE)
               go is0 0 appE
             _ -> error $ $(curLoc) ++ "Cannot make function input for: " ++ showPpr e
   case templ of
@@ -642,20 +648,22 @@ mkFunInput resId e = do
     go _ _ (Case scrut ty alts@(_:_:_)) = do
       -- TODO: check that it's okay to use `mkUnsafeSystemName`
       let resId'  = resId {varName = mkUnsafeSystemName "~RESULT" 0}
-      selectionDecls <- mkSelection resId' scrut ty alts
+      selectionDecls <- mkSelection (Right resId') scrut ty alts
       nm <- mkUniqueIdentifier Basic "selection"
-      return (Right ((nm,selectionDecls),Reg))
+      tcm <- Lens.use tcCache
+      let scrutTy = termType tcm scrut
+      scrutHTy <- unsafeCoreTypeToHWTypeM' $(curLoc) scrutTy
+      ite <- Lens.use backEndITE
+      let wr = case iteAlts scrutHTy alts of
+                 Just _ | ite -> Wire
+                 _ -> Reg
+      return (Right ((nm,selectionDecls),wr))
 
     go is0 _ e'@(Letrec {}) = do
       tcm <- Lens.use tcCache
       let normE = splitNormalized tcm e'
       (_,[],[],_,[],binders,resultM) <- case normE of
-        Right norm -> do
-          isCur <- Lens.use globalInScope
-          globalInScope Lens..= is0 `unionInScope` isCur
-          norm' <- mkUniqueNormalized Nothing norm
-          globalInScope Lens..= isCur
-          return norm'
+        Right norm -> mkUniqueNormalized is0 Nothing norm
         Left err -> error err
       case resultM of
         Just result -> do

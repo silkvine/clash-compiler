@@ -8,6 +8,7 @@
   Type and instance definitions for Netlist modules
 -}
 
+{-# LANGUAGE CPP                        #-}
 {-# LANGUAGE DeriveAnyClass             #-}
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DerivingStrategies         #-}
@@ -19,7 +20,10 @@
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
 
-{-# OPTIONS_GHC -Wno-orphans #-}
+-- since GHC 8.6 we can haddock individual contructor fields \o/
+#if __GLASGOW_HASKELL__ >= 806
+#define FIELD ^
+#endif
 
 module Clash.Netlist.Types
   ( Declaration (..,NetDecl)
@@ -29,11 +33,12 @@ where
 
 import Control.DeepSeq
 import Control.Monad.Fail                   (MonadFail)
-import Control.Monad.State                  (State)
-import Control.Monad.State.Strict           (MonadIO, MonadState, StateT)
+import Control.Monad.State                  as Lazy (State)
+import Control.Monad.State.Strict           as Strict
+  (State,MonadIO, MonadState, StateT)
 import Data.Bits                            (testBit)
 import Data.Binary                          (Binary(..))
-import Data.Hashable
+import Data.Hashable                        (Hashable)
 import Data.HashMap.Strict                  (HashMap)
 import Data.IntMap                          (IntMap, empty)
 import qualified Data.Set                   as Set
@@ -50,12 +55,13 @@ import Clash.Backend                        (Backend)
 import Clash.Core.Type                      (Type)
 import Clash.Core.Var                       (Attr')
 import Clash.Core.TyCon                     (TyConMap)
-import Clash.Core.VarEnv                    (VarEnv, InScopeSet)
+import Clash.Core.VarEnv                    (VarEnv)
 import Clash.Driver.Types                   (BindingMap, ClashOpts)
 import Clash.Netlist.BlackBox.Types         (BlackBoxTemplate)
 import Clash.Netlist.Id                     (IdType)
 import Clash.Primitives.Types               (CompiledPrimMap)
-import Clash.Signal.Internal                (ClockKind, ResetKind)
+import Clash.Signal.Internal
+  (ResetPolarity, ActiveEdge, ResetKind, InitBehavior)
 import Clash.Util                           (makeLenses)
 
 import Clash.Annotations.BitRepresentation.Internal
@@ -66,6 +72,8 @@ import Clash.Annotations.BitRepresentation.Internal
 newtype NetlistMonad a =
   NetlistMonad { runNetlist :: StateT NetlistState IO a }
   deriving newtype (Functor, Monad, Applicative, MonadState NetlistState, MonadIO, MonadFail)
+
+type HWMap = HashMap Type (Either String FilteredHWType)
 
 -- | State of the NetlistMonad
 data NetlistState
@@ -78,7 +86,8 @@ data NetlistState
   -- ^ Cached components
   , _primitives     :: CompiledPrimMap
   -- ^ Primitive Definitions
-  , _typeTranslator :: CustomReprs -> TyConMap -> Type -> Maybe (Either String FilteredHWType)
+  , _typeTranslator :: CustomReprs -> TyConMap -> Type
+                    -> Strict.State HWMap (Maybe (Either String FilteredHWType))
   -- ^ Hardcoded Type -> HWType translator
   , _tcCache        :: TyConMap
   -- ^ TyCon cache
@@ -100,15 +109,19 @@ data NetlistState
   , _componentPrefix :: (Maybe Identifier,Maybe Identifier)
   -- ^ Prefix for top-level components, and prefix for all other components
   , _customReprs    :: CustomReprs
-  , _globalInScope  :: InScopeSet
   , _clashOpts      :: ClashOpts
   -- ^ Settings Clash was called with
   , _isTestBench    :: Bool
   -- ^ Whether we're compiling a testbench (suppresses some warnings)
+  , _backEndITE :: Bool
+  -- ^ Whether the backend supports ifThenElse expressions
+  , _htyCache :: HWMap
   }
 
 -- | Signal reference
 type Identifier = Text
+
+type Comment = Text
 
 -- | Component: base unit of a Netlist
 data Component
@@ -151,29 +164,29 @@ data HWType
   -- ^ Boolean type
   | Bit
   -- ^ Bit type
-  | BitVector     !Size
+  | BitVector !Size
   -- ^ BitVector of a specified size
-  | Index         !Integer
+  | Index !Integer
   -- ^ Unsigned integer with specified (exclusive) upper bounder
-  | Signed        !Size
+  | Signed !Size
   -- ^ Signed integer of a specified size
-  | Unsigned      !Size
+  | Unsigned !Size
   -- ^ Unsigned integer of a specified size
-  | Vector        !Size       !HWType
+  | Vector !Size !HWType
   -- ^ Vector type
-  | RTree         !Size       !HWType
+  | RTree !Size !HWType
   -- ^ RTree type
-  | Sum           !Identifier [Identifier]
+  | Sum !Identifier [Identifier]
   -- ^ Sum type: Name and Constructor names
-  | Product       !Identifier (Maybe [Text]) [HWType]
+  | Product !Identifier (Maybe [Text]) [HWType]
   -- ^ Product type: Name, field names, and field types. Field names will be
   -- populated when using records.
-  | SP            !Identifier [(Identifier,[HWType])]
+  | SP !Identifier [(Identifier,[HWType])]
   -- ^ Sum-of-Product type: Name and Constructor names + field types
-  | Clock         !Identifier !Integer !ClockKind
-  -- ^ Clock type with specified name and period
-  | Reset         !Identifier !Integer !ResetKind
-  -- ^ Reset type corresponding to clock with a specified name and period
+  | Clock !Identifier
+  -- ^ Clock type corresponding to domain /Identifier/
+  | Reset !Identifier
+  -- ^ Reset type corresponding to domain /Identifier/
   | BiDirectional !PortDirection !HWType
   -- ^ Tagging type indicating a bidirectional (inout) port
   | CustomSP !Identifier !DataRepr' !Size [(ConstrRepr', Identifier, [HWType])]
@@ -183,14 +196,10 @@ data HWType
   -- ^ Same as Sum, but with a user specified bit representation. For more info,
   -- see: Clash.Annotations.BitRepresentations.
   | Annotated [Attr'] !HWType
-  -- ^ Annotated
-  deriving (Eq,Ord,Show,Generic)
-
-instance Hashable ClockKind
-instance Hashable ResetKind
-
-instance Hashable HWType
-instance NFData HWType
+  -- ^ Annotated with HDL attributes
+  | KnownDomain !Identifier !Integer !ActiveEdge !ResetKind !InitBehavior !ResetPolarity
+  -- ^ Domain name, period, active edge, reset kind, initial value behavior
+  deriving (Eq, Ord, Show, Generic, NFData, Hashable)
 
 -- | Extract hardware attributes from Annotated. Returns an empty list if
 -- non-Annotated given or if Annotated has an empty list of attributes.
@@ -200,61 +209,46 @@ hwTypeAttrs _                       = []
 
 -- | Internals of a Component
 data Declaration
-  = Assignment !Identifier !Expr
-  -- ^ Signal assignment:
-  --
-  -- * Signal to assign
-  --
-  -- * Assigned expression
-  | CondAssignment !Identifier !HWType !Expr !HWType [(Maybe Literal,Expr)]
-  -- ^ Conditional signal assignment:
-  --
-  -- * Signal to assign
-  --
-  -- * Type of the result/alternatives
-  --
-  -- * Scrutinized expression
-  --
-  -- * Type of the scrutinee
-  --
-  -- * List of: (Maybe expression scrutinized expression is compared with,RHS of alternative)
-  | InstDecl EntityOrComponent (Maybe Identifier) !Identifier !Identifier [(Expr,HWType,Expr)] [(Expr,PortDirection,HWType,Expr)]
-  -- ^ Instantiation of another component:
-  --
-  -- * Whether it's an entity or a component
-  --
-  -- * Comment to add to the generated code
-  --
-  -- * The component's (or entity's) name
-  --
-  -- * Instance label
-  --
-  -- * List of parameters for this component (param name, param type, param value)
-  --
-  -- * Ports (port name, port direction, type, assignment)
+  -- | Signal assignment
+  = Assignment
+      !Identifier -- FIELD Signal to assign
+      !Expr       -- FIELD Assigned expression
+
+  -- | Conditional signal assignment:
+  | CondAssignment
+      !Identifier            -- FIELD Signal to assign
+      !HWType                -- FIELD Type of the result/alternatives
+      !Expr                  -- FIELD Scrutinized expression
+      !HWType                -- FIELD Type of the scrutinee
+      [(Maybe Literal,Expr)] -- FIELD List of: (Maybe expression scrutinized expression is compared with,RHS of alternative)
+
+  -- | Instantiation of another component:
+  | InstDecl
+      EntityOrComponent                  -- FIELD Whether it's an entity or a component
+      (Maybe Comment)                    -- FIELD Comment to add to the generated code
+      !Identifier                        -- FIELD The component's (or entity's) name
+      !Identifier                        -- FIELD Instance label
+      [(Expr,HWType,Expr)]               -- FIELD List of parameters for this component (param name, param type, param value)
+      [(Expr,PortDirection,HWType,Expr)] -- FIELD Ports (port name, port direction, type, assignment)
+
+  -- | Instantiation of blackbox declaration
   | BlackBoxD
-      -- Primitive name:
-      !Text
-      -- VHDL only: add /library/ declarations:
-      [BlackBoxTemplate]
-      -- VHDL only: add /use/ declarations:
-      [BlackBoxTemplate]
-      -- Intel/Quartus only: create a /.qsys/ file from given template:
-      [((Text,Text),BlackBox)]
-      -- Template tokens:
-      !BlackBox
-      -- Context in which tokens should be rendered:
-      BlackBoxContext
-  -- ^ Instantiation of blackbox declaration
+      !Text                    -- FIELD Primitive name
+      [BlackBoxTemplate]       -- FIELD VHDL only: add @library@ declarations
+      [BlackBoxTemplate]       -- FIELD VHDL only: add @use@ declarations
+      [((Text,Text),BlackBox)] -- FIELD Intel Quartus only: create a @.qsys@ file from given template
+      !BlackBox                -- FIELD Template tokens
+      BlackBoxContext          -- FIELD Context in which tokens should be rendered
+
+  -- | Signal declaration
   | NetDecl'
-      (Maybe Identifier)         -- Note; will be inserted as a comment in target hdl
-      WireOrReg                  -- Wire or register
-      !Identifier                -- Name of signal
-      (Either Identifier HWType) -- Pointer to type of signal or type of signal
-      -- ^ Signal declaration
+      (Maybe Comment)            -- FIELD Note; will be inserted as a comment in target hdl
+      WireOrReg                  -- FIELD Wire or register
+      !Identifier                -- FIELD Name of signal
+      (Either Identifier HWType) -- FIELD Pointer to type of signal or type of signal
   deriving Show
 
-data EntityOrComponent = Entity | Comp
+data EntityOrComponent = Entity | Comp | Empty
   deriving Show
 
 data WireOrReg = Wire | Reg
@@ -263,7 +257,7 @@ data WireOrReg = Wire | Reg
 instance NFData WireOrReg
 
 pattern NetDecl
-  :: Maybe Identifier
+  :: Maybe Comment
   -- ^ Note; will be inserted as a comment in target hdl
   -> Identifier
   -- ^ Name of signal
@@ -283,11 +277,10 @@ instance NFData Declaration where
 -- | Expression Modifier
 data Modifier
   = Indexed (HWType,Int,Int) -- ^ Index the expression: (Type of expression,DataCon tag,Field Tag)
-  | DC (HWType,Int) -- ^ See expression in a DataCon context: (Type of the expression, DataCon tag)
-  | VecAppend -- ^ See the expression in the context of a Vector append operation
-  | RTreeAppend -- ^ See the expression in the context of a Tree append operation
-  | Sliced (HWType,Int,Int)
-  -- ^ Slice the identifier of the given type from start to end
+  | DC (HWType,Int)          -- ^ See expression in a DataCon context: (Type of the expression, DataCon tag)
+  | VecAppend                -- ^ See the expression in the context of a Vector append operation
+  | RTreeAppend              -- ^ See the expression in the context of a Tree append operation
+  | Sliced (HWType,Int,Int)  -- ^ Slice the identifier of the given type from start to end
   | Nested Modifier Modifier
   deriving Show
 
@@ -296,24 +289,19 @@ data Expr
   = Literal    !(Maybe (HWType,Size)) !Literal -- ^ Literal expression
   | DataCon    !HWType       !Modifier  [Expr] -- ^ DataCon application
   | Identifier !Identifier   !(Maybe Modifier) -- ^ Signal reference
-  | DataTag    !HWType       !(Either Identifier Identifier) -- ^ @Left e@: tagToEnum#, @Right e@: dataToTag#
+  | DataTag    !HWType       !(Either Identifier Identifier) -- ^ @Left e@: tagToEnum\#, @Right e@: dataToTag\#
+
+  -- | Instantiation of a BlackBox expression
   | BlackBoxE
-      -- Primitive name:
-      !Text
-      -- VHDL only: add /library/ declarations:
-      [BlackBoxTemplate]
-      -- VHDL only: add /use/ declarations:
-      [BlackBoxTemplate]
-      -- Intel/Quartus only: create a /.qsys/ file from given template.
-      [((Text,Text),BlackBox)]
-      -- Template tokens:
-      !BlackBox
-      -- Context in which tokens should be rendered:
-      !BlackBoxContext
-      -- Wrap in paretheses?:
-      !Bool
-  -- ^ Instantiation of a BlackBox expression
+      !Text                    -- FIELD Primitive name
+      [BlackBoxTemplate]       -- FIELD VHDL only: add @library@ declarations
+      [BlackBoxTemplate]       -- FIELD VHDL only: add @use@ declarations:
+      [((Text,Text),BlackBox)] -- FIELD Intel/Quartus only: create a @.qsys@ file from given template.
+      !BlackBox                -- FIELD Template tokens
+      !BlackBoxContext         -- FIELD Context in which tokens should be rendered
+      !Bool                    -- FIELD Wrap in paretheses?
   | ConvBV     (Maybe Identifier) HWType Bool Expr
+  | IfThenElse Expr Expr Expr
   deriving Show
 
 -- | Literals used in an expression
@@ -345,7 +333,8 @@ toBit m i = if testBit m 0
 -- | Context used to fill in the holes of a BlackBox template
 data BlackBoxContext
   = Context
-  { bbResult    :: (Expr,HWType) -- ^ Result name and type
+  { bbName      :: Text -- ^ Blackbox function name (for error reporting)
+  , bbResult    :: (Expr,HWType) -- ^ Result name and type
   , bbInputs    :: [(Expr,HWType,Bool)] -- ^ Argument names, types, and whether it is a literal
   , bbFunctions :: IntMap (Either BlackBox (Identifier,[Declaration])
                           ,WireOrReg
@@ -381,7 +370,7 @@ data TemplateFunction where
   TemplateFunction
     :: [Int]
     -> (BlackBoxContext -> Bool)
-    -> (forall s . Backend s => BlackBoxContext -> State s Doc)
+    -> (forall s . Backend s => BlackBoxContext -> Lazy.State s Doc)
     -> TemplateFunction
 
 instance Show BlackBox where
@@ -398,10 +387,11 @@ instance Binary TemplateFunction where
   get = (\is -> TemplateFunction is err err) <$> get
     where err = const $ error "TemplateFunction functions can't be preserved by serialisation"
 
-emptyBBContext :: BlackBoxContext
-emptyBBContext
+emptyBBContext :: Text -> BlackBoxContext
+emptyBBContext n
   = Context
-  { bbResult      = (Identifier (pack "__EMPTY__") Nothing, Void Nothing)
+  { bbName        = n
+  , bbResult      = (Identifier (pack "__EMPTY__") Nothing, Void Nothing)
   , bbInputs      = []
   , bbFunctions   = empty
   , bbQsysIncName = []

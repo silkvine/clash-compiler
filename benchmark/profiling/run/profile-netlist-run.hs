@@ -4,7 +4,6 @@ import           Clash.Backend
 import           Clash.Core.Name
 import           Clash.Core.TyCon
 import           Clash.Core.Var
-import           Clash.Core.VarEnv
 import           Clash.Driver
 import           Clash.Driver.Types
 import           Clash.Netlist
@@ -47,7 +46,7 @@ benchFile :: FilePath -> [FilePath] -> FilePath -> IO ()
 benchFile tmpDir idirs src = do
   env <- setupEnv src
   putStrLn $ "Doing netlist generation of " ++ src
-  let (transformedBindings,is0,topEntities,primMap,tcm,reprs,topEntity) = env
+  let (transformedBindings,topEntities,primMap,tcm,reprs,topEntity) = env
       primMap'   = fmap (fmap unremoveBBfunc) primMap
       opts1      = opts tmpDir idirs
       iw         = opt_intWidth opts1
@@ -57,19 +56,19 @@ benchFile tmpDir idirs src = do
       mkId1      = evalState mkIdentifier hdlState'
       extId      = evalState extendIdentifier hdlState'
       prefixM    = (Nothing,Nothing)
+      ite        = ifThenElseExpr hdlState'
       seen       = HashMap.empty
       hdlDir     = fromMaybe "." (opt_hdlDir opts1) </>
                          Clash.Backend.name hdlState' </>
                          takeWhile (/= '.') topEntityS
   (netlist,_) <-
-    genNetlist False opts1 reprs transformedBindings is0 topEntities primMap'
-               tcm typeTrans iw mkId1 extId seen hdlDir prefixM topEntity
+    genNetlist False opts1 reprs transformedBindings topEntities primMap'
+               tcm typeTrans iw mkId1 extId ite seen hdlDir prefixM topEntity
   netlist `deepseq` putStrLn ".. done\n"
 
 setupEnv
   :: FilePath
   -> IO (BindingMap
-        ,InScopeSet
         ,[(Id, Maybe TopEntity, Maybe Id)]
         ,CompiledPrimMap'
         ,TyConMap

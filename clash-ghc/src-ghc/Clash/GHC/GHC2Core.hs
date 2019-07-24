@@ -92,7 +92,7 @@ import TyCoRep    (Coercion (..), TyLit (..), Type (..))
 import Unique     (Uniquable (..), Unique, getKey, hasKey)
 import Var        (Id, TyVar, Var, idDetails,
                    isTyVar, varName, varType,
-                   varUnique, idInfo)
+                   varUnique, idInfo, isGlobalId)
 import Var        (TyVarBndr (..))
 import VarSet     (isEmptyVarSet)
 
@@ -323,7 +323,7 @@ coreToTerm primMap unlocs srcsp coreExpr = Reader.runReaderT (term coreExpr) src
       e'   <- term e
       return (C.Letrec xes' e')
 
-    term' (Case _ _ ty [])  = C.TyApp (C.Prim (pack "EmptyCase") C.undefinedTy)
+    term' (Case _ _ ty [])  = C.TyApp (C.Prim (pack "EmptyCase") (C.PrimInfo C.undefinedTy C.WorkNever))
                                 <$> lift (coreToType ty)
     term' (Case e b ty alts) = do
      let usesBndr = any ( not . isEmptyVarSet . exprSomeFreeVars (== b))
@@ -349,9 +349,9 @@ coreToTerm primMap unlocs srcsp coreExpr = Reader.runReaderT (term coreExpr) src
           -> C.Cast <$> term e <*> lift (coreToType ty1) <*> lift (coreToType ty2)
         _ -> term e
     term' (Tick _ e)        = term e
-    term' (Type t)          = C.TyApp (C.Prim (pack "_TY_") C.undefinedTy) <$>
+    term' (Type t)          = C.TyApp (C.Prim (pack "_TY_") (C.PrimInfo C.undefinedTy C.WorkNever)) <$>
                                 lift (coreToType t)
-    term' (Coercion co)     = C.TyApp (C.Prim (pack "_CO_") C.undefinedTy) <$>
+    term' (Coercion co)     = C.TyApp (C.Prim (pack "_CO_") (C.PrimInfo C.undefinedTy C.WorkNever)) <$>
                                 lift (coreToType (coercionType co))
 
     lookupPrim :: Text -> Maybe (Maybe ResolvedPrimitive)
@@ -363,7 +363,7 @@ coreToTerm primMap unlocs srcsp coreExpr = Reader.runReaderT (term coreExpr) src
         xType  <- coreToType (varType x)
         case isDataConId_maybe x of
           Just dc -> case lookupPrim xNameS of
-            Just _  -> return $ C.Prim xNameS xType
+            Just p  -> return $ C.Prim xNameS (C.PrimInfo xType (maybe C.WorkVariable workInfo p))
             Nothing -> if isDataConWrapId x && not (isNewTyCon (dataConTyCon dc))
               then let xInfo = idInfo x
                        unfolding = unfoldingInfo xInfo
@@ -373,7 +373,7 @@ coreToTerm primMap unlocs srcsp coreExpr = Reader.runReaderT (term coreExpr) src
                           _ -> error ("Unexpected unfolding for DC wrapper: " ++ showPpr unsafeGlobalDynFlags x)
               else C.Data <$> coreToDataCon dc
           Nothing -> case lookupPrim xNameS of
-            Just (Just (Primitive f _))
+            Just (Just (Primitive f wi _))
               | f == pack "Clash.Signal.Internal.mapSignal#" -> return (mapSignalTerm xType)
               | f == pack "Clash.Signal.Internal.signal#"    -> return (signalTerm xType)
               | f == pack "Clash.Signal.Internal.appSignal#" -> return (appSignalTerm xType)
@@ -387,19 +387,22 @@ coreToTerm primMap unlocs srcsp coreExpr = Reader.runReaderT (term coreExpr) src
               | f == pack "GHC.Magic.runRW#"                 -> return (runRWTerm xType)
               | f == pack "Clash.Class.BitPack.packXWith"    -> return (packXWithTerm xType)
               | f == pack "Clash.Sized.Internal.BitVector.checkUnpackUndef" -> return (checkUnpackUndefTerm xType)
-              | otherwise                                    -> return (C.Prim xNameS xType)
-            Just (Just (BlackBox {})) ->
-              return $ C.Prim xNameS xType
-            Just (Just (BlackBoxHaskell {})) ->
-              return $ C.Prim xNameS xType
+              | otherwise                                    -> return (C.Prim xNameS (C.PrimInfo xType wi))
+            Just (Just (BlackBox {workInfo = wi})) ->
+              return $ C.Prim xNameS (C.PrimInfo xType wi)
+            Just (Just (BlackBoxHaskell {workInfo = wi})) ->
+              return $ C.Prim xNameS (C.PrimInfo xType wi)
             Just Nothing ->
               -- Was guarded by "DontTranslate". We don't know yet if Clash will
               -- actually use it later on, so we don't err here.
-              return $ C.Prim xNameS xType
+              return $ C.Prim xNameS (C.PrimInfo xType C.WorkAlways)
             Nothing
-              | x `elem` unlocs -> return (C.Prim xNameS xType)
-              | pack "$cshow" `isInfixOf` xNameS -> return (C.Prim xNameS xType)
-              | otherwise       -> C.Var <$> coreToId x
+              | x `elem` unlocs
+              -> return (C.Prim xNameS (C.PrimInfo xType C.WorkAlways))
+              | pack "$cshow" `isInfixOf` xNameS
+              -> return (C.Prim xNameS (C.PrimInfo xType C.WorkAlways))
+              | otherwise
+              -> C.Var <$> coreToId x
 
     alt (DEFAULT   , _ , e) = (C.DefaultPat,) <$> term e
     alt (LitAlt l  , _ , e) = (C.LitPat (coreToLiteral l),) <$> term e
@@ -717,7 +720,9 @@ coreToTyVar tv =
 coreToId :: Id
          -> State GHC2CoreState C.Id
 coreToId i =
-  C.mkId <$> coreToType (varType i) <*> coreToVar i
+  C.mkId <$> coreToType (varType i) <*> pure scope <*> coreToVar i
+ where
+  scope = if isGlobalId i then C.GlobalId else C.LocalId
 
 coreToVar :: Var
           -> State GHC2CoreState (C.Name a)
@@ -735,9 +740,13 @@ coreToName
   -> State GHC2CoreState (C.Name a)
 coreToName toName toUnique toString v = do
   ns <- toString (toName v)
-  let key = getKey (toUnique v)
-      loc = getSrcSpan (toName v)
-  return (C.Name C.User ns key loc)
+  let key  = getKey (toUnique v)
+      loc  = getSrcSpan (toName v)
+      sort | ns == "ds" || Text.isPrefixOf "$" ns
+           = C.System
+           | otherwise
+           = C.User
+  return (C.Name sort ns key loc)
 
 qualifiedNameString'
   :: Name
@@ -797,8 +806,8 @@ mapSignalTerm (C.ForAllTy aTV (C.ForAllTy bTV (C.ForAllTy clkTV funTy))) =
     fName = C.mkUnsafeSystemName "f" 0
     xName = C.mkUnsafeSystemName "x" 1
     fTy   = C.mkFunTy aTy bTy
-    fId   = C.mkId fTy fName
-    xId   = C.mkId aTy xName
+    fId   = C.mkLocalId fTy fName
+    xId   = C.mkLocalId aTy xName
 
 mapSignalTerm ty = error $ $(curLoc) ++ show ty
 
@@ -819,7 +828,7 @@ signalTerm (C.ForAllTy aTV (C.ForAllTy clkTV funTy)) =
   where
     (C.FunTy _ aTy) = C.tyView funTy
     xName = C.mkUnsafeSystemName "x" 0
-    xId   = C.mkId aTy xName
+    xId   = C.mkLocalId aTy xName
 
 signalTerm ty = error $ $(curLoc) ++ show ty
 
@@ -851,8 +860,8 @@ appSignalTerm (C.ForAllTy clkTV (C.ForAllTy aTV (C.ForAllTy bTV funTy))) =
     fName = C.mkUnsafeSystemName "f" 0
     xName = C.mkUnsafeSystemName "x" 1
     fTy   = C.mkFunTy aTy bTy
-    fId   = C.mkId fTy fName
-    xId   = C.mkId aTy xName
+    fId   = C.mkLocalId fTy fName
+    xId   = C.mkLocalId aTy xName
 
 appSignalTerm ty = error $ $(curLoc) ++ show ty
 
@@ -879,7 +888,7 @@ vecUnwrapTerm (C.ForAllTy tTV (C.ForAllTy nTV (C.ForAllTy aTV funTy))) =
   where
     (C.FunTy _ vsTy) = C.tyView funTy
     vsName           = C.mkUnsafeSystemName "vs" 0
-    vsId             = C.mkId vsTy vsName
+    vsId             = C.mkLocalId vsTy vsName
 
 vecUnwrapTerm ty = error $ $(curLoc) ++ show ty
 
@@ -914,9 +923,9 @@ traverseTerm (C.ForAllTy fTV (C.ForAllTy aTV (C.ForAllTy bTV (C.ForAllTy clkTV f
     dictName = C.mkUnsafeSystemName "dict" 0
     gName    = C.mkUnsafeSystemName "g" 1
     xName    = C.mkUnsafeSystemName "x" 2
-    dictId   = C.mkId dictTy dictName
-    gId      = C.mkId gTy gName
-    xId      = C.mkId xTy xName
+    dictId   = C.mkLocalId dictTy dictName
+    gId      = C.mkLocalId gTy gName
+    xId      = C.mkLocalId xTy xName
 
 traverseTerm ty = error $ $(curLoc) ++ show ty
 
@@ -947,8 +956,8 @@ dollarTerm (C.ForAllTy rTV (C.ForAllTy aTV (C.ForAllTy bTV funTy))) =
     (C.FunTy aTy _)       = C.tyView funTy''
     fName = C.mkUnsafeSystemName "f" 0
     xName = C.mkUnsafeSystemName "x" 1
-    fId   = C.mkId fTy fName
-    xId   = C.mkId aTy xName
+    fId   = C.mkLocalId fTy fName
+    xId   = C.mkLocalId aTy xName
 
 dollarTerm ty = error $ $(curLoc) ++ show ty
 
@@ -983,8 +992,8 @@ withFrozenCallStackTerm (C.ForAllTy aTV funTy) =
     (C.FunTy callStackTy fTy) = C.tyView funTy
     callStackName = C.mkUnsafeSystemName "callStack" 0
     fName         = C.mkUnsafeSystemName "f" 1
-    callStackId   = C.mkId callStackTy callStackName
-    fId           = C.mkId fTy fName
+    callStackId   = C.mkLocalId callStackTy callStackName
+    fId           = C.mkLocalId fTy fName
 
 withFrozenCallStackTerm ty = error $ $(curLoc) ++ show ty
 
@@ -1005,7 +1014,7 @@ idTerm (C.ForAllTy aTV funTy) =
   where
     (C.FunTy xTy _) = C.tyView funTy
     xName           = C.mkUnsafeSystemName "x" 0
-    xId             = C.mkId xTy xName
+    xId             = C.mkLocalId xTy xName
 
 idTerm ty = error $ $(curLoc) ++ show ty
 
@@ -1023,12 +1032,12 @@ runRWTerm (C.ForAllTy rTV (C.ForAllTy oTV funTy)) =
   C.TyLam rTV (
   C.TyLam oTV (
   C.Lam   fId (
-  (C.App (C.Var fId) (C.Prim rwNm rwTy)))))
+  (C.App (C.Var fId) (C.Prim rwNm (C.PrimInfo rwTy C.WorkNever))))))
   where
     (C.FunTy fTy _)  = C.tyView funTy
     (C.FunTy rwTy _) = C.tyView fTy
     fName            = C.mkUnsafeSystemName "f" 0
-    fId              = C.mkId fTy fName
+    fId              = C.mkLocalId fTy fName
     rwNm             = pack "GHC.Prim.realWorld#"
 
 runRWTerm ty = error $ $(curLoc) ++ show ty
@@ -1054,8 +1063,8 @@ packXWithTerm (C.ForAllTy nTV (C.ForAllTy aTV funTy)) =
     C.FunTy fTy _    = C.tyView rTy
     knName           = C.mkUnsafeSystemName "kn" 0
     fName            = C.mkUnsafeSystemName "f" 1
-    knId             = C.mkId knTy knName
-    fId              = C.mkId fTy fName
+    knId             = C.mkLocalId knTy knName
+    fId              = C.mkLocalId fTy fName
 
 packXWithTerm ty = error $ $(curLoc) ++ show ty
 
@@ -1083,9 +1092,9 @@ checkUnpackUndefTerm (C.ForAllTy nTV (C.ForAllTy aTV funTy)) =
     knName            = C.mkUnsafeSystemName "kn" 0
     tpName            = C.mkUnsafeSystemName "tp" 1
     fName             = C.mkUnsafeSystemName "f" 2
-    knId              = C.mkId knTy knName
-    tpId              = C.mkId tpTy tpName
-    fId               = C.mkId fTy fName
+    knId              = C.mkLocalId knTy knName
+    tpId              = C.mkLocalId tpTy tpName
+    fId               = C.mkLocalId fTy fName
 
 checkUnpackUndefTerm ty = error $ $(curLoc) ++ show ty
 

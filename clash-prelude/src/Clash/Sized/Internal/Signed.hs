@@ -7,6 +7,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE DeriveAnyClass             #-}
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE KindSignatures             #-}
 {-# LANGUAGE MagicHash                  #-}
@@ -42,7 +43,7 @@ module Clash.Sized.Internal.Signed
   , ge#
   , gt#
   , le#
-    -- ** Enum (not synthesisable)
+    -- ** Enum (not synthesizable)
   , enumFrom#
   , enumFromThen#
   , enumFromTo#
@@ -91,6 +92,7 @@ import Data.Data                      (Data)
 import Data.Default.Class             (Default (..))
 import Data.Proxy                     (Proxy (..))
 import Text.Read                      (Read (..), ReadPrec)
+import GHC.Generics                   (Generic)
 import GHC.TypeLits                   (KnownNat, Nat, type (+), natVal)
 import GHC.TypeLits.Extra             (Max)
 import Language.Haskell.TH            (TypeQ, appT, conT, litT, numTyLit, sigE)
@@ -107,7 +109,8 @@ import Clash.Prelude.BitIndex         ((!), msb, replaceBit, split)
 import Clash.Prelude.BitReduction     (reduceAnd, reduceOr)
 import Clash.Sized.Internal.BitVector (BitVector (BV), Bit, (++#), high, low, undefError)
 import qualified Clash.Sized.Internal.BitVector as BV
-import Clash.XException               (ShowX (..), Undefined (..), errorX, showsPrecXWith)
+import Clash.XException
+  (ShowX (..), Undefined (..), errorX, showsPrecXWith, rwhnfX)
 
 -- | Arbitrary-width signed integer represented by @n@ bits, including the sign
 -- bit.
@@ -146,11 +149,13 @@ import Clash.XException               (ShowX (..), Undefined (..), errorX, shows
 -- -3
 newtype Signed (n :: Nat) =
     -- | The constructor, 'S', and the field, 'unsafeToInteger', are not
-    -- synthesisable.
+    -- synthesizable.
     S { unsafeToInteger :: Integer}
-  deriving Data
+  deriving (Data, Generic)
 
-instance Undefined (Signed n) where deepErrorX = errorX
+instance Undefined (Signed n) where
+  deepErrorX = errorX
+  rnfX = rwhnfX
 
 {-# NOINLINE size# #-}
 size# :: KnownNat n => Signed n -> Int
@@ -169,7 +174,7 @@ instance Show (Signed n) where
 instance ShowX (Signed n) where
   showsPrecX = showsPrecXWith showsPrec
 
--- | None of the 'Read' class' methods are synthesisable.
+-- | None of the 'Read' class' methods are synthesizable.
 instance KnownNat n => Read (Signed n) where
   readPrec = fromIntegral <$> (readPrec :: ReadPrec Integer)
 
@@ -219,7 +224,7 @@ gt# (S n) (S m) = n > m
 le# (S n) (S m) = n <= m
 
 -- | The functions: 'enumFrom', 'enumFromThen', 'enumFromTo', and
--- 'enumFromThenTo', are not synthesisable.
+-- 'enumFromThenTo', are not synthesizable.
 instance KnownNat n => Enum (Signed n) where
   succ           = (+# fromInteger# 1)
   pred           = (-# fromInteger# 1)

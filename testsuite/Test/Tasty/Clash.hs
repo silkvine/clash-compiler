@@ -560,7 +560,9 @@ outputTest'
   -> BuildTarget
   -- ^ Build target
   -> [String]
-  -- ^ Extra clash arguments
+  -- ^ Extra Clash arguments
+  -> [String]
+  -- ^ Extra GHC arguments
   -> String
   -- ^ Module name
   -> String
@@ -570,7 +572,7 @@ outputTest'
   -- item in the list will be the root node, while the first one will be the
   -- one closest to the test.
   -> TestTree
-outputTest' env target extraArgs modName funcName path =
+outputTest' env target extraClashArgs extraGhcArgs modName funcName path =
   withResource acquire tastyRelease (const seqTests)
     where
       path' = show target:path
@@ -589,15 +591,20 @@ outputTest' env target extraArgs modName funcName path =
              , "-XDataKinds"
              , "-XDeriveAnyClass"
              , "-XDeriveGeneric"
+             , "-XDerivingStrategies"
              , "-XDeriveLift"
              , "-XExplicitForAll"
              , "-XExplicitNamespaces"
              , "-XFlexibleContexts"
+             , "-XFlexibleInstances"
              , "-XKindSignatures"
              , "-XMagicHash"
              , "-XMonoLocalBinds"
              , "-XNoImplicitPrelude"
              , "-XNoMonomorphismRestriction"
+#if __GLASGOW_HASKELL__ < 806
+             , "-XTypeInType"
+#endif
 #if __GLASGOW_HASKELL__ >= 806
              , "-XNoStarIsType"
 #endif
@@ -612,7 +619,8 @@ outputTest' env target extraArgs modName funcName path =
              , "-XTypeOperators"
              , "--ghc-arg=-main-is"
              , "--ghc-arg=" ++ modName ++ "." ++ funcName ++ show target
-             , env </> modName <.> "hs"
+             ] ++ map ("--ghc-arg="++) extraGhcArgs ++
+             [ env </> modName <.> "hs"
              , workDir </> topFile
              ]
 
@@ -628,7 +636,7 @@ outputTest' env target extraArgs modName funcName path =
       workDir = testDirectory path'
 
       seqTests = testGroup (show target) $ sequenceTests path' $
-        [ clashHDL target (sourceDirectory </> env) extraArgs modName workDir
+        [ clashHDL target (sourceDirectory </> env) extraClashArgs modName workDir
         , ("runghc", testProgram "runghc" "cabal" args NoGlob PrintStdErr False Nothing)
         ]
 
@@ -639,6 +647,8 @@ outputTest
   -- ^ Build targets
   -> [String]
   -- ^ Extra clash arguments
+  -> [String]
+  -- ^ Extra GHC arguments
   -> String
   -- ^ Module name
   -> String
@@ -648,8 +658,8 @@ outputTest
   -- item in the list will be the root node, while the first one will be the
   -- one closest to the test.
   -> TestTree
-outputTest env targets extraArgs modName funcName path =
+outputTest env targets extraClashArgs extraGhcArgs modName funcName path =
   let testName = modName ++ " [output test]" in
   let path' = testName : path in
   testGroup testName
-    [outputTest' env target extraArgs modName funcName path' | target <- targets]
+    [outputTest' env target extraClashArgs extraGhcArgs modName funcName path' | target <- targets]

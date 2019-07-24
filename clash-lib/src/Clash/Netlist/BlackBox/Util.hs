@@ -57,9 +57,15 @@ import           Clash.Netlist.Types             (BlackBoxContext (..),
                                                   Declaration(BlackBoxD))
 import qualified Clash.Netlist.Types             as N
 import           Clash.Netlist.Util              (typeSize)
-import           Clash.Signal.Internal           (ClockKind (Gated),
-                                                  ResetKind (Synchronous))
+import           Clash.Signal.Internal
+  (ResetKind(..), ResetPolarity(..), InitBehavior(..))
 import           Clash.Util
+
+-- | Strip as many "Void" layers as possible. Might still return a Void if the
+-- void doesn't contain a hwtype.
+stripVoid :: HWType -> HWType
+stripVoid (Void (Just e)) = stripVoid e
+stripVoid e = e
 
 inputHole :: Element -> Maybe Int
 inputHole = \case
@@ -330,6 +336,27 @@ renderElem b (SigD e m) = do
   t  <- getMon (hdlSig e' ty)
   return (const (renderOneLine t))
 
+renderElem b (Period n) = do
+  let (_, ty, _) = bbInputs b !! n
+  case stripVoid ty of
+    KnownDomain _ period _ _ _ _ ->
+      return $ const $ Text.pack $ show period
+    _ ->
+      error $ $(curLoc) ++ "Period: Expected `KnownDomain` or `KnownConfiguration`, not: " ++ show ty
+
+renderElem b (Tag n) = do
+  let (_, ty, _) = bbInputs b !! n
+  case stripVoid ty of
+    KnownDomain dom _ _ _ _ _ ->
+      return (const (Text.pack (Data.Text.unpack dom)))
+    Reset dom ->
+      return (const (Text.pack (Data.Text.unpack dom)))
+    Clock dom ->
+      return (const (Text.pack (Data.Text.unpack dom)))
+    _ ->
+      error $ $(curLoc) ++ "Tag: Expected `KnownDomain` or `KnownConfiguration`, not: " ++ show ty
+
+
 renderElem b (IF c t f) = do
   iw <- iwWidth
   syn <- hdlSyn
@@ -374,14 +401,48 @@ renderElem b (IF c t f) = do
                       Literal {}   -> 1
                       BlackBoxE {} -> 1
                       _            -> 0
-      (IsGated n) -> let (_,ty,_) = bbInputs b !! n
-                     in case ty of
-                       Clock _ _ Gated -> 1
-                       _               -> 0
-      (IsSync n) -> let (_,ty,_) = bbInputs b !! n
-                    in case ty of
-                       Reset _ _ Synchronous -> 1
-                       _                     -> 0
+
+      (IsActiveEnable n) ->
+        let (e, ty, _) = bbInputs b !! n in
+        case (e, ty) of
+          (Literal Nothing (BoolLit True), Bool)  -> 0
+          -- TODO: Emit warning? If enable signal is inferred as always False,
+          -- TODO: the component will never be enabled. This is probably not the
+          -- TODO: user's intention.
+          (Literal Nothing (BoolLit False), Bool) -> 1
+          (_, Bool)                               -> 1
+          _ ->
+            error $ $(curLoc) ++ "IsActiveEnable: Expected Bool, not: " ++ show ty
+
+      (ActiveEdge edgeRequested n) ->
+        let (_, ty, _) = bbInputs b !! n in
+        case stripVoid ty of
+          KnownDomain _ _ edgeActual _ _ _ ->
+            if edgeRequested == edgeActual then 1 else 0
+          _ ->
+            error $ $(curLoc) ++ "ActiveEdge: Expected `KnownDomain` or `KnownConfiguration`, not: " ++ show ty
+
+      (IsSync n) ->
+        let (_, ty, _) = bbInputs b !! n in
+        case stripVoid ty of
+          KnownDomain _ _ _ Synchronous _ _ -> 1
+          KnownDomain _ _ _ Asynchronous _ _ -> 0
+          _ -> error $ $(curLoc) ++ "IsSync: Expected `KnownDomain` or `KnownConfiguration`, not: " ++ show ty
+
+      (IsInitDefined n) ->
+        let (_, ty, _) = bbInputs b !! n in
+        case stripVoid ty of
+          KnownDomain _ _ _ _ Defined _ -> 1
+          KnownDomain _ _ _ _ Unknown _ -> 0
+          _ -> error $ $(curLoc) ++ "IsInitDefined: Expected `KnownDomain` or `KnownConfiguration`, not: " ++ show ty
+
+      (IsActiveHigh n) ->
+        let (_, ty, _) = bbInputs b !! n in
+        case stripVoid ty of
+          KnownDomain _ _ _ _ _ ActiveHigh -> 1
+          KnownDomain _ _ _ _ _ ActiveLow -> 0
+          _ -> error $ $(curLoc) ++ "IsActiveHigh: Expected `KnownDomain` or `KnownConfiguration`, not: " ++ show ty
+
       (StrCmp [Text t1] n) ->
         let (e,_,_) = bbInputs b !! n
         in  case exprToString e of
@@ -521,6 +582,12 @@ renderTag b (Depth e) = return . Text.pack . show . treeDepth $ lineToType b [e]
     treeDepth (Void (Just (RTree n _))) = n
     treeDepth thing =
       error $ $(curLoc) ++ "treeDepth of a non-tree type: " ++ show thing
+
+renderTag b (MaxIndex e) = return . Text.pack . show . vecLen $ lineToType b [e]
+  where
+    vecLen (Vector n _) = n-1
+    vecLen thing =
+      error $ $(curLoc) ++ "vecLen of a non-vector type: " ++ show thing
 
 renderTag b e@(TypElem _)   = let ty = lineToType b [e]
                               in  renderOneLine <$> getMon (hdlType Internal ty)
@@ -699,6 +766,9 @@ prettyElem (Length e) = do
 prettyElem (Depth e) = do
   e' <- prettyElem e
   renderOneLine <$> (string "~DEPTH" <> brackets (string e'))
+prettyElem (MaxIndex e) = do
+  e' <- prettyElem e
+  renderOneLine <$> (string "~MAXINDEX" <> brackets (string e'))
 prettyElem (FilePath e) = do
   e' <- prettyElem e
   renderOneLine <$> (string "~FILE" <> brackets (string e'))
@@ -737,8 +807,16 @@ prettyElem (Sel e i) = do
   renderOneLine <$> (string "~SEL" <> brackets (string e') <> brackets (int i))
 prettyElem (IsLit i) = renderOneLine <$> (string "~ISLIT" <> brackets (int i))
 prettyElem (IsVar i) = renderOneLine <$> (string "~ISVAR" <> brackets (int i))
-prettyElem (IsGated i) = renderOneLine <$> (string "~ISGATED" <> brackets (int i))
+prettyElem (IsActiveHigh i) = renderOneLine <$> (string "~ISACTIVEHIGH" <> brackets (int i))
+prettyElem (IsActiveEnable i) = renderOneLine <$> (string "~ISACTIVEENABLE" <> brackets (int i))
+
+-- Domain attributes:
+prettyElem (Tag i) = renderOneLine <$> (string "~TAG" <> brackets (int i))
+prettyElem (Period i) = renderOneLine <$> (string "~PERIOD" <> brackets (int i))
+prettyElem (ActiveEdge e i) = renderOneLine <$> (string "~ACTIVEEDGE" <> brackets (string (Text.pack (show e))) <> brackets (int i))
 prettyElem (IsSync i) = renderOneLine <$> (string "~ISSYNC" <> brackets (int i))
+prettyElem (IsInitDefined i) = renderOneLine <$> (string "~ISINITDEFINED" <> brackets (int i))
+
 prettyElem (StrCmp es i) = do
   es' <- prettyBlackBox es
   renderOneLine <$> (string "~STRCMP" <> brackets (string es') <> brackets (int i))
@@ -823,6 +901,7 @@ walkElement f el = maybeToList (f el) ++ walked
         Size e -> go e
         Length e -> go e
         Depth e -> go e
+        MaxIndex e -> go e
         Gen _ -> []
         And es -> concatMap go es
         CmpLE e1 e2 -> go e1 ++ go e2
@@ -831,8 +910,13 @@ walkElement f el = maybeToList (f el) ++ walked
         Sel e _ -> go e
         IsLit _ -> []
         IsVar _ -> []
-        IsGated _ -> []
+        Tag _ -> []
+        Period _ -> []
+        ActiveEdge _ _ -> []
         IsSync _ -> []
+        IsInitDefined _ -> []
+        IsActiveHigh _ -> []
+        IsActiveEnable _ -> []
         StrCmp es _ -> concatMap go es
         OutputWireReg _ -> []
         Vars _ -> []
@@ -847,6 +931,7 @@ usedVariables (DataCon _ _ es)  = concatMap usedVariables es
 usedVariables (DataTag _ e')    = [either id id e']
 usedVariables (Literal {})      = []
 usedVariables (ConvBV _ _ _ e') = usedVariables e'
+usedVariables (IfThenElse e1 e2 e3) = concatMap usedVariables [e1,e2,e3]
 usedVariables (BlackBoxE _ _ _ _ t bb _) = nub (sList ++ sList')
   where
     matchArg (Arg _ i) = Just i
@@ -865,13 +950,60 @@ usedArguments :: N.BlackBox -> [Int]
 usedArguments (N.BBFunction _nm _hsh (N.TemplateFunction k _ _)) = k
 usedArguments (N.BBTemplate t) = nub (concatMap (walkElement matchArg) t)
   where
-    matchArg (Component (Decl i _)) = Just i
-    matchArg (Arg _ i)      = Just i
-    matchArg (Lit i)        = Just i
-    matchArg (Name i)       = Just i
-    matchArg (Var _ i)      = Just i
-    matchArg (Const i)      = Just i
-    matchArg _              = Nothing
+    matchArg =
+      \case
+        Arg _ i -> Just i
+        Component (Decl i _) -> Just i
+        Const i -> Just i
+        IsLit i -> Just i
+        IsActiveEnable i -> Just i
+        Lit i -> Just i
+        Name i -> Just i
+        Var _ i -> Just i
+
+        -- Domain properties (only need type):
+        IsInitDefined _ -> Nothing
+        ActiveEdge _ _ -> Nothing
+        IsSync _ -> Nothing
+        Period _ -> Nothing
+        Tag _ -> Nothing
+
+        -- Others. Template tags only using types of arguments can be considered
+        -- "not used".
+        And _ -> Nothing
+        ArgGen _ _ -> Nothing
+        BV _ _ _ -> Nothing
+        CmpLE _ _ -> Nothing
+        CompName -> Nothing
+        Depth _ -> Nothing
+        DevNull _ -> Nothing
+        Err _ -> Nothing
+        FilePath _ -> Nothing
+        Gen _ -> Nothing
+        GenSym _ _ -> Nothing
+        HdlSyn _ -> Nothing
+        IF _ _ _ -> Nothing
+        IncludeName _ -> Nothing
+        IndexType _ -> Nothing
+        IsActiveHigh _ -> Nothing
+        IsVar _ -> Nothing
+        IW64 -> Nothing
+        Length _ -> Nothing
+        MaxIndex _ -> Nothing
+        OutputWireReg _ -> Nothing
+        Repeat _ _ -> Nothing
+        Result _ -> Nothing
+        Sel _ _ -> Nothing
+        SigD _ _ -> Nothing
+        Size _ -> Nothing
+        StrCmp _ _ -> Nothing
+        Sym _ _ -> Nothing
+        Template _ _ -> Nothing
+        Text _ -> Nothing
+        Typ _ -> Nothing
+        TypElem _ -> Nothing
+        TypM _ -> Nothing
+        Vars _ -> Nothing
 
 onBlackBox
   :: (BlackBoxTemplate -> r)

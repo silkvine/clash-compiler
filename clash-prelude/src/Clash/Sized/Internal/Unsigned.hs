@@ -8,6 +8,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE DeriveAnyClass             #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE MagicHash                  #-}
 {-# LANGUAGE MultiParamTypeClasses      #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
@@ -40,7 +41,7 @@ module Clash.Sized.Internal.Unsigned
   , ge#
   , gt#
   , le#
-    -- ** Enum (not synthesisable)
+    -- ** Enum (not synthesizable)
   , enumFrom#
   , enumFromThen#
   , enumFromTo#
@@ -83,6 +84,7 @@ import Data.Data                      (Data)
 import Data.Default.Class             (Default (..))
 import Data.Proxy                     (Proxy (..))
 import Text.Read                      (Read (..), ReadPrec)
+import GHC.Generics                   (Generic)
 import GHC.TypeLits                   (KnownNat, Nat, type (+), natVal)
 import GHC.TypeLits.Extra             (Max)
 import Language.Haskell.TH            (TypeQ, appT, conT, litT, numTyLit, sigE)
@@ -100,7 +102,8 @@ import Clash.Prelude.BitIndex         ((!), msb, replaceBit, split)
 import Clash.Prelude.BitReduction     (reduceOr)
 import Clash.Sized.Internal.BitVector (BitVector (BV), Bit, high, low, undefError)
 import qualified Clash.Sized.Internal.BitVector as BV
-import Clash.XException               (ShowX (..), Undefined (..), errorX, showsPrecXWith)
+import Clash.XException
+  (ShowX (..), Undefined (..), errorX, showsPrecXWith, rwhnfX)
 
 -- | Arbitrary-width unsigned integer represented by @n@ bits
 --
@@ -135,9 +138,9 @@ import Clash.XException               (ShowX (..), Undefined (..), errorX, shows
 -- 0
 newtype Unsigned (n :: Nat) =
     -- | The constructor, 'U', and the field, 'unsafeToInteger', are not
-    -- synthesisable.
+    -- synthesizable.
     U { unsafeToInteger :: Integer }
-  deriving Data
+  deriving (Data, Generic)
 
 {-# NOINLINE size# #-}
 size# :: KnownNat n => Unsigned n -> Int
@@ -156,9 +159,11 @@ instance Show (Unsigned n) where
 instance ShowX (Unsigned n) where
   showsPrecX = showsPrecXWith showsPrec
 
-instance Undefined (Unsigned n) where deepErrorX = errorX
+instance Undefined (Unsigned n) where
+  deepErrorX = errorX
+  rnfX = rwhnfX
 
--- | None of the 'Read' class' methods are synthesisable.
+-- | None of the 'Read' class' methods are synthesizable.
 instance KnownNat n => Read (Unsigned n) where
   readPrec = fromIntegral <$> (readPrec :: ReadPrec Natural)
 
@@ -205,7 +210,7 @@ gt# (U n) (U m) = n > m
 le# (U n) (U m) = n <= m
 
 -- | The functions: 'enumFrom', 'enumFromThen', 'enumFromTo', and
--- 'enumFromThenTo', are not synthesisable.
+-- 'enumFromThenTo', are not synthesizable.
 instance KnownNat n => Enum (Unsigned n) where
   succ           = (+# fromInteger# 1)
   pred           = (-# fromInteger# 1)

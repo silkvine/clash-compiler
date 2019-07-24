@@ -31,6 +31,7 @@ import qualified Control.Exception    as Exception
 import Control.Monad                  as X ((<=<),(>=>))
 import Control.Monad.State            (MonadState,State,StateT,runState)
 import qualified Control.Monad.State  as State
+import Data.Typeable                  (Typeable)
 import Data.Function                  as X (on)
 import Data.Hashable                  (Hashable)
 import Data.HashMap.Lazy              (HashMap)
@@ -39,11 +40,15 @@ import Data.Maybe                     (fromMaybe)
 import Data.Text.Prettyprint.Doc
 import Data.Text.Prettyprint.Doc.Render.String
 import Data.Version                   (Version)
+import qualified Data.Time.Format     as Clock
+import qualified Data.Time.Clock      as Clock
+import Data.Time.Clock                (UTCTime)
 import Control.Lens
 import Debug.Trace                    (trace)
 import GHC.Base                       (Int(..),isTrue#,(==#),(+#))
 import GHC.Integer.Logarithms         (integerLogBase#)
 import GHC.Stack                      (HasCallStack, callStack, prettyCallStack)
+import Type.Reflection                (tyConPackage, typeRepTyCon, typeOf)
 import qualified Language.Haskell.TH  as TH
 
 import SrcLoc                         (SrcSpan, noSrcSpan)
@@ -210,6 +215,7 @@ combineM f g (x,y) = (,) <$> f x <*> g y
 traceIf :: Bool -> String -> a -> a
 traceIf True  msg = trace msg
 traceIf False _   = id
+{-# INLINE traceIf #-}
 
 -- | Monadic version of 'Data.List.partition'
 partitionM :: Monad m
@@ -264,6 +270,16 @@ indexNote :: String
           -> Int
           -> a
 indexNote note = \xs i -> fromMaybe (error note) (indexMaybe xs i)
+
+-- | Safe version of 'head'
+headMaybe :: [a] -> Maybe a
+headMaybe (a:_) = Just a
+headMaybe _ = Nothing
+
+-- | Safe version of 'tail'
+tailMaybe :: [a] -> Maybe [a]
+tailMaybe (_:as) = Just as
+tailMaybe _ = Nothing
 
 -- | Split the second list at the length of the first list
 splitAtList :: [b] -> [a] -> ([a], [a])
@@ -357,3 +373,22 @@ anyM p (x:xs) = do
     return True
   else
     anyM p xs
+
+-- | Get the package id of the type of a value
+-- >>> pkgIdFromTypeable (undefined :: TopEntity)
+-- "clash-prelude-0.99.3-64904d90747cb49e17166bbc86fec8678918e4ead3847193a395b258e680373c"
+pkgIdFromTypeable :: Typeable a => a -> String
+pkgIdFromTypeable = tyConPackage . typeRepTyCon . typeOf
+
+reportTimeDiff :: UTCTime -> UTCTime -> String
+reportTimeDiff start end =
+  Clock.formatTime Clock.defaultTimeLocale fmt
+    (Clock.UTCTime (toEnum 0) (fromRational (toRational diff)))
+ where
+  diff = Clock.diffUTCTime start end
+  fmt  | diff >= 3600
+       = "%-Hh%-Mm%-S%03Qs"
+       | diff >= 60
+       = "%-Mm%-S%03Qs"
+       | otherwise
+       = "%-S%03Qs"

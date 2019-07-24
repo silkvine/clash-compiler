@@ -1,5 +1,6 @@
 [ { "BlackBox" :
     { "name"      : "Clash.XException.seqX"
+    , "workInfo"  : "Never"
     , "kind"      : "Expression"
     , "type"      : "seqX :: a -> b -> b"
     , "template"  : "~ARG[1]"
@@ -7,9 +8,18 @@
   }
 , { "BlackBox" :
     { "name"      : "Clash.XException.errorX"
+    , "workInfo"  : "Constant"
     , "kind"      : "Expression"
-    , "type"      : "errorX :: HasCallStack -> String -> a"
+    , "type"      : "errorX :: HasCallStack => String -> a"
     , "template"  : "~ERRORO"
     }
+  }
+, { "BlackBox" :
+     { "name"      : "Clash.XException.deepseqX"
+     , "workInfo"  : "Never"
+     , "kind"      : "Expression"
+     , "type"      : "deepseqX :: Undefined a => a -> b -> b"
+     , "template"  : "~ARG[2]"
+     }
   }
 ]

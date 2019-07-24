@@ -75,6 +75,8 @@ flagsClash r = [
   , defFlag "fclash-component-prefix"        $ SepArg (liftEwM . setComponentPrefix r)
   , defFlag "fclash-old-inline-strategy"     $ NoArg (liftEwM (setOldInlineStrategy r))
   , defFlag "fclash-no-escaped-identifiers"  $ NoArg (liftEwM (setNoEscapedIds r))
+  , defFlag "fclash-compile-ultra"           $ NoArg (liftEwM (setUltra r))
+  , defFlag "fclash-force-undefined"         $ OptIntSuffix (setUndefined r)
   ]
 
 -- | Print deprecated flag warning
@@ -180,3 +182,13 @@ setOldInlineStrategy r = modifyIORef r (\c -> c {opt_newInlineStrat = False})
 
 setNoEscapedIds :: IORef ClashOpts -> IO ()
 setNoEscapedIds r = modifyIORef r (\c -> c {opt_escapedIds = False})
+
+setUltra :: IORef ClashOpts -> IO ()
+setUltra r = modifyIORef r (\c -> c {opt_ultra = True})
+
+setUndefined :: IORef ClashOpts -> Maybe Int -> EwM IO ()
+setUndefined _ (Just x) | x < 0 || x > 1 =
+  addWarn ("-fclash-force-undefined=" ++ show x ++ " ignored, " ++ show x ++
+           " not in range [0,1]")
+setUndefined r iM =
+  liftEwM (modifyIORef r (\c -> c {opt_forceUndefined = Just iM}))

@@ -71,10 +71,13 @@ runClashTest =
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "CharTest"            (["","CharTest_testBench"],"CharTest_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "ClassOps"            (["","ClassOps_testBench"],"ClassOps_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "CountTrailingZeros"  (["","CountTrailingZeros_testBench"],"CountTrailingZeros_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "DeepseqX"            (["","DeepseqX_testBench"],"DeepseqX_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "DivMod"              ([""],"DivMod_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "IrrefError"          ([""],"IrrefError_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "LambdaDrop"          ([""],"LambdaDrop_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "LotOfStates"         (["","LotOfStates_testBench"],"LotOfStates_testBench",True)
+        -- TODO: Fix for VHDL. ModelSim / GHDL simulate _extremely_ slowly
+        , runTest ("tests" </> "shouldwork" </> "Basic") (defBuild \\ [VHDL]) [] "MultipleHidden"      (["","MultipleHidden_testBench"],"MultipleHidden_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "NameOverlap"         (["nameoverlap"],"nameoverlap",False)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "NestedPrimitives"    ([""],"NestedPrimitives_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "NestedPrimitives2"   ([""],"NestedPrimitives2_topEntity",False)
@@ -88,15 +91,16 @@ runClashTest =
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "SimpleConstructor"   ([""],"SimpleConstructor_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "TagToEnum"           ([""],"TagToEnum_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "TestIndex"           ([""],"TestIndex_topEntity",False)
+        , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "Time"                (["","Time_testBench"],"Time_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Basic") defBuild [] "TwoFunctions"        ([""],"TwoFunctions_topEntity",False)
         ]
-        , clashTestGroup "ShouldFail" [
-          runFailingTest ("tests" </> "shouldfail") defBuild [] "RecursiveBoxed" (Just "Callgraph after normalisation contains following recursive components")
-        , runFailingTest ("tests" </> "shouldfail") defBuild [] "RecursiveDatatype" (Just "Not in normal form: no Letrec")
-        , runFailingTest ("tests" </> "shouldfail" </> "InvalidPrimitive") defBuild ["-itests/shouldfail/InvalidPrimitive"] "InvalidPrimitive" (Just "InvalidPrimitive.json")
-        -- Disabled, due to it eating gigabytes of memory:
-        -- , runFailingTest ("tests" </> "shouldfail") defBuild [] "RecursivePoly" (Just "??")
-        ]
+        , clashTestGroup "ShouldFail"
+          [ runFailingTest ("tests" </> "shouldfail") [VHDL] [] "RecursiveBoxed" (Just "Callgraph after normalisation contains following recursive components")
+          , runFailingTest ("tests" </> "shouldfail") [VHDL] [] "RecursiveDatatype" (Just "Not in normal form: no Letrec")
+          , runFailingTest ("tests" </> "shouldfail" </> "InvalidPrimitive") [VHDL] ["-itests/shouldfail/InvalidPrimitive"] "InvalidPrimitive" (Just "InvalidPrimitive.json")
+          -- Disabled, due to it eating gigabytes of memory:
+          -- , runFailingTest ("tests" </> "shouldfail") defBuild [] "RecursivePoly" (Just "??")
+          ]
       , clashTestGroup "BitVector"
         [ runTest ("tests" </> "shouldwork" </> "BitVector") defBuild [] "Box"              (["","Box_testBench"],"Box_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "BitVector") defBuild [] "BoxGrow"          (["","BoxGrow_testBench"],"BoxGrow_testBench",True)
@@ -104,12 +108,13 @@ runClashTest =
         , runTest ("tests" </> "shouldwork" </> "BitVector") defBuild [] "ReduceZero"       (["","ReduceZero_testBench"],"ReduceZero_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "BitVector") defBuild [] "ReduceOne"        (["","ReduceOne_testBench"],"ReduceOne_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "BitVector") defBuild [] "ExtendingNumZero" (["","ExtendingNumZero_testBench"],"ExtendingNumZero_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "BitVector") defBuild ["-fconstraint-solver-iterations=15"] "GenericBitPack"   (["","GenericBitPack_testBench"],"GenericBitPack_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "BitVector") defBuild [] "AppendZero"       (["","AppendZero_testBench"],"AppendZero_testBench",True)
         ]
       , clashTestGroup "BlackBox"
-        [ outputTest ("tests" </> "shouldwork" </> "BlackBox") [VHDL]   [] "TemplateFunction" "main"
-        , outputTest ("tests" </> "shouldwork" </> "BlackBox") [VHDL]   [] "BlackBoxFunction" "main"
-        , outputTest ("tests" </> "shouldwork" </> "Signal")   defBuild [] "BlockRamLazy"     "main"
+        [ outputTest ("tests" </> "shouldwork" </> "BlackBox") [VHDL]   [] [] "TemplateFunction" "main"
+        , outputTest ("tests" </> "shouldwork" </> "BlackBox") [VHDL]   [] [] "BlackBoxFunction" "main"
+        , outputTest ("tests" </> "shouldwork" </> "Signal")   defBuild [] [] "BlockRamLazy"     "main"
         ]
       , clashTestGroup "BoxedFunctions"
         [ runTest ("tests" </> "shouldwork" </> "BoxedFunctions") defBuild [] "DeadRecursiveBoxed" ([""],"DeadRecursiveBoxed_topEntity",False)
@@ -136,6 +141,16 @@ runClashTest =
         , runTest ("tests" </> "shouldwork" </> "CustomReprs" </> "Rotate")        defBuild [] "Rotate"                 (["", "Rotate_testBench"],"Rotate_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "CustomReprs" </> "Deriving")      defBuild [] "BitPackDerivation"      (["", "BitPackDerivation_testBench"],"BitPackDerivation_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "CustomReprs" </> "Indexed")       defBuild [] "Indexed"                (["", "Indexed_testBench"],"Indexed_testBench",True)
+        ]
+      , clashTestGroup "DDR"
+        [ runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRinGA" (["","DDRinGA_testBench"],"DDRinGA_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRinGS" (["","DDRinGS_testBench"],"DDRinGS_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRinUA" (["","DDRinUA_testBench"],"DDRinUA_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRinUS" (["","DDRinUS_testBench"],"DDRinUS_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRoutUA" (["","DDRoutUA_testBench"],"DDRoutUA_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRoutUS" (["","DDRoutUS_testBench"],"DDRoutUS_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRoutGA" (["","DDRoutGA_testBench"],"DDRoutGA_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "DDR") defBuild [] "DDRoutGS" (["","DDRoutGS_testBench"],"DDRoutGS_testBench",True)
         ]
       , clashTestGroup "DSignal"
         [ runTest ("tests" </> "shouldwork" </> "DSignal") defBuild [] "DelayedFold" (["","DelayedFold_testBench"],"DelayedFold_testBench",True)
@@ -174,10 +189,14 @@ runClashTest =
         , runTest ("tests" </> "shouldwork" </> "HOPrim") defBuild [] "VecFun"    (["","VecFun_testBench"],"VecFun_testBench",True)
       ]
       , clashTestGroup "Numbers"
-        [ runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Bounds"       (["","Bounds_testBench"],"Bounds_testBench",True)
+        [ runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "BitInteger"   (["","BitInteger_testBench"],"BitInteger_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Bounds"       (["","Bounds_testBench"],"Bounds_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild ["-itests/shouldwork/Numbers", "-fconstraint-solver-iterations=15"] "ExpWithGhcCF"        (["","ExpWithGhcCF_testBench"],"ExpWithGhcCF_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild ["-itests/shouldwork/Numbers", "-fconstraint-solver-iterations=15"] "ExpWithClashCF"        (["","ExpWithClashCF_testBench"],"ExpWithClashCF_testBench",True)
+        , outputTest ("tests" </> "shouldwork" </> "Numbers") defBuild ["-itests/shouldwork/Numbers"] ["-itests/shouldwork/Numbers"] "ExpWithClashCF"  "main"
         -- TODO: re-enable for Verilog
-        , runTest ("tests" </> "shouldwork" </> "Numbers") [VHDL] ["-itests/shouldwork/Numbers","-fclash-inline-limit=300"] "NumConstantFoldingTB"       (["","NumConstantFoldingTB_testBench"],"NumConstantFoldingTB_testBench",True)
-        , outputTest ("tests" </> "shouldwork" </> "Numbers") defBuild ["-fclash-inline-limit=300"] "NumConstantFolding"  "main"
+        , runTest ("tests" </> "shouldwork" </> "Numbers") (defBuild \\ [Verilog]) ["-itests/shouldwork/Numbers","-fclash-inline-limit=300"] "NumConstantFoldingTB"       (["","NumConstantFoldingTB_testBench"],"NumConstantFoldingTB_testBench",True)
+        , outputTest ("tests" </> "shouldwork" </> "Numbers") defBuild ["-fclash-inline-limit=300", "-fconstraint-solver-iterations=15"] ["-itests/shouldwork/Numbers"] "NumConstantFolding"  "main"
 #if MIN_VERSION_base(4,12,0)
         -- Naturals are broken on GHC <= 8.4. See https://github.com/clash-lang/clash-compiler/pull/473
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Naturals"     (["","Naturals_testBench"],"Naturals_testBench",True)
@@ -185,11 +204,14 @@ runClashTest =
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "NegativeLits" (["","NegativeLits_testBench"],"NegativeLits_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Resize"       (["","Resize_testBench"],"Resize_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Resize2"      (["","Resize2_testBench"],"Resize2_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Resize3"      (["","Resize3_testBench"],"Resize3_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "SatMult"      ([""],"SatMult_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild ["-itests/shouldwork/Numbers"] "ShiftRotate"         (["","ShiftRotate_testBench"],"ShiftRotate_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "SignedProjectionTB"   (["","SignedProjectionTB_testBench"],"SignedProjectionTB_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "SignedZero"   (["","SignedZero_testBench"],"SignedZero_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Signum"   (["","Signum_testBench"],"Signum_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "Strict"       (["","Strict_testBench"],"Strict_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "UnsignedZero" (["","UnsignedZero_testBench"],"UnsignedZero_testBench",True)
-        , runTest ("tests" </> "shouldwork" </> "Numbers") defBuild [] "SignedZero"   (["","SignedZero_testBench"],"SignedZero_testBench",True)
         ]
       , clashTestGroup "Polymorphism"
         [ runTest ("tests" </> "shouldwork" </> "Polymorphism") defBuild [] "ExistentialBoxed"  ([""],"ExistentialBoxed_topEntity",False)
@@ -214,16 +236,18 @@ runClashTest =
       ]
       , clashTestGroup "Signal"
         [ runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "AlwaysHigh"      ([""],"AlwaysHigh_topEntity",False)
-        , outputTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "BlockRamLazy"    "main"
+        , outputTest ("tests" </> "shouldwork" </> "Signal") defBuild [] [] "BlockRamLazy"    "main"
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "BlockRamFile"    (["","BlockRamFile_testBench"],"BlockRamFile_testBench",True)
-        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild ["-fclash-no-prim-warn"] "GatedClock" (["gated","source","testbench"],"testbench",True)
-        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "GatedClockWidth"                  (["","GatedClockWidth_testBench"],"GatedClockWidth_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "BlockRam1"        (["","BlockRam1_testBench"],"BlockRam1_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "BlockRamTest"    ([""],"BlockRamTest_topEntity",False)
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "DelayedReset"    (["","DelayedReset_testBench"],"DelayedReset_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "NoCPR"           (["example"],"example",False)
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "Ram"             (["","Ram_testBench"],"Ram_testBench",True)
-        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "RegisterAS"      (["","RegisterAS_testBench"],"RegisterAS_testBench",True)
-        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "RegisterSS"      (["","RegisterSS_testBench"],"RegisterSS_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "RegisterAR"      (["","RegisterAR_testBench"],"RegisterAR_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "RegisterSR"      (["","RegisterSR_testBench"],"RegisterSR_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "RegisterAE"      (["","RegisterAE_testBench"],"RegisterAE_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "RegisterSE"      (["","RegisterSE_testBench"],"RegisterSE_testBench",True)
+        , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "ResetLow"        (["","ResetLow_testBench"],"ResetLow_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "Rom"             (["","Rom_testBench"],"Rom_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "RomFile"         (["","RomFile_testBench"],"RomFile_testBench",True)
         , runTest ("tests" </> "shouldwork" </> "Signal") defBuild [] "SigP"            ([""],"SigP_topEntity",False)
@@ -235,8 +259,8 @@ runClashTest =
         , runFailingTest ("tests" </> "shouldfail" </> "Signal") defBuild [] "MAC" (Just "Can't match template for \"Clash.Signal.Internal.register#\"")
         ]
       , clashTestGroup "SynthesisAttributes"
-        [ outputTest ("tests" </> "shouldwork" </> "SynthesisAttributes") defBuild [] "Simple"  "main"
-        , outputTest ("tests" </> "shouldwork" </> "SynthesisAttributes") defBuild []  "Product" "main"
+        [ outputTest ("tests" </> "shouldwork" </> "SynthesisAttributes") defBuild [] [] "Simple"  "main"
+        , outputTest ("tests" </> "shouldwork" </> "SynthesisAttributes") defBuild [] [] "Product" "main"
         , runTest ("tests" </> "shouldwork" </> "SynthesisAttributes") defBuild [] "Product" (["", "Product_testBench"],"Product_testBench",True)
         , clashTestGroup "ShouldFail" [
             runFailingTest ("tests" </> "shouldfail" </> "SynthesisAttributes") defBuild [] "ProductInArgs"   (Just "Attempted to split Product into a number of HDL ports.")
@@ -253,17 +277,17 @@ runClashTest =
       , clashTestGroup "TopEntity"
         -- VHDL tests disabled for now: I can't figure out how to generate a static name whilst retaining the ability to actually test..
         [ runTest ("tests" </> "shouldwork" </> "TopEntity")    [Verilog] [] "PortNames" (["","PortNames_topEntity","PortNames_testBench"],"PortNames_testBench",True)
-        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] "PortNames" "main"
+        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] [] "PortNames" "main"
         , runTest ("tests" </> "shouldwork" </> "TopEntity")    [Verilog] [] "PortProducts" (["","PortProducts_topEntity","PortProducts_testBench"],"PortProducts_testBench",True)
-        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] "PortProducts" "main"
+        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] [] "PortProducts" "main"
         , runTest ("tests" </> "shouldwork" </> "TopEntity")    [Verilog] [] "PortProductsSum" (["","PortProductsSum_topEntity","PortProductsSum_testBench"],"PortProductsSum_testBench",True)
-        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] "PortProductsSum" "main"
+        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] [] "PortProductsSum" "main"
         , runTest ("tests" </> "shouldwork" </> "TopEntity")    [Verilog] [] "PortNamesWithUnit" (["","PortNamesWithUnit_topEntity","PortNamesWithUnit_testBench"],"PortNamesWithUnit_testBench",True)
-        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] "PortNamesWithUnit" "main"
+        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] [] "PortNamesWithUnit" "main"
         , runTest ("tests" </> "shouldwork" </> "TopEntity")    [Verilog] [] "PortNamesWithVector" (["","PortNamesWithVector_topEntity","PortNamesWithVector_testBench"],"PortNamesWithVector_testBench",True)
-        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] "PortNamesWithVector" "main"
+        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] [] "PortNamesWithVector" "main"
         , runTest ("tests" </> "shouldwork" </> "TopEntity")    [Verilog] [] "PortNamesWithRTree" (["","PortNamesWithRTree_topEntity","PortNamesWithRTree_testBench"],"PortNamesWithRTree_testBench",True)
-        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] "PortNamesWithRTree" "main"
+        , outputTest ("tests" </> "shouldwork" </> "TopEntity") [Verilog] [] [] "PortNamesWithRTree" "main"
         , runTest ("tests" </> "shouldwork" </> "TopEntity")    defBuild [] "TopEntHOArg" (["f","g"],"f",False)
         ]
       , clashTestGroup "Void"

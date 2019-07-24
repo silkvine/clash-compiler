@@ -13,18 +13,23 @@ import Data.Monoid
 
 {-# NOINLINE topEntity #-}
 topEntity
-    :: Clock System Source
-    -> Reset System Asynchronous
+    :: Clock System
+    -> Reset System
+    -> Enable System
     -> ( Signal System Bit
        )
-topEntity = exposeClockReset output
+topEntity = exposeClockResetEnable output
   where
     cpuIn = pure CPUIn{ cpuInMem = 0x00 }
     cpuOut = mealyState (runCPU defaultOut cpu) initState cpuIn
     output = boolToBit . (== 0x00) . cpuOutMemAddr <$> cpuOut
 
-mealyState :: (HiddenClockReset domain gated synchronous)
-           => (i -> State s o) -> s -> (Signal domain i -> Signal domain o)
+mealyState
+  :: ( HiddenClockResetEnable tag
+     , Undefined s )
+  => (i -> State s o)
+  -> s
+  -> (Signal tag i -> Signal tag o)
 mealyState f = mealy $ \s x -> let (y, s') = runState (f x) s in (s', y)
 
 data Phase

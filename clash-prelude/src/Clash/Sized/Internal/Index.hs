@@ -1,6 +1,6 @@
 {-|
 Copyright  :  (C) 2013-2016, University of Twente,
-                  2016     , Myrtle Software Ltd
+                  2016-2019, Myrtle Software Ltd
 License    :  BSD2 (see the file LICENSE)
 Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 -}
@@ -9,6 +9,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 {-# LANGUAGE DataKinds             #-}
 {-# LANGUAGE DeriveAnyClass        #-}
 {-# LANGUAGE DeriveDataTypeable    #-}
+{-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE KindSignatures        #-}
 {-# LANGUAGE MagicHash             #-}
@@ -35,6 +36,9 @@ module Clash.Sized.Internal.Index
     Index (..)
     -- * Construction
   , fromSNat
+  -- * Accessors
+  -- ** Length information
+  , size#
     -- * Type classes
     -- ** BitPack
   , pack#
@@ -47,7 +51,7 @@ module Clash.Sized.Internal.Index
   , ge#
   , gt#
   , le#
-    -- ** Enum (not synthesisable)
+    -- ** Enum (not synthesizable)
   , enumFrom#
   , enumFromThen#
   , enumFromTo#
@@ -73,6 +77,7 @@ module Clash.Sized.Internal.Index
 where
 
 import Control.DeepSeq            (NFData (..))
+import Data.Bits                  (Bits (..), FiniteBits (..))
 import Data.Data                  (Data)
 import Data.Default.Class         (Default (..))
 import Data.Proxy                 (Proxy (..))
@@ -80,6 +85,7 @@ import Text.Read                  (Read (..), ReadPrec)
 import Language.Haskell.TH        (TypeQ, appT, conT, litT, numTyLit, sigE)
 import Language.Haskell.TH.Syntax (Lift(..))
 import Numeric.Natural            (Natural)
+import GHC.Generics               (Generic)
 import GHC.Stack                  (HasCallStack)
 import GHC.TypeLits               (CmpNat, KnownNat, Nat, type (+), type (-),
                                    type (*), type (<=), natVal)
@@ -92,9 +98,12 @@ import Clash.Class.BitPack        (BitPack (..), packXWith)
 import Clash.Class.Num            (ExtendingNum (..), SaturatingNum (..),
                                    SaturationMode (..))
 import Clash.Class.Resize         (Resize (..))
-import {-# SOURCE #-} Clash.Sized.Internal.BitVector (BitVector (BV),undefError)
+import Clash.Prelude.BitIndex     (replaceBit)
+import {-# SOURCE #-} Clash.Sized.Internal.BitVector (BitVector (BV), high, low, undefError)
+import qualified Clash.Sized.Internal.BitVector as BV
 import Clash.Promoted.Nat         (SNat, snatToNum, leToPlusKN)
-import Clash.XException           (ShowX (..), Undefined (..), errorX, showsPrecXWith)
+import Clash.XException
+  (ShowX (..), Undefined (..), errorX, showsPrecXWith, rwhnfX)
 
 -- | Arbitrary-bounded unsigned integer represented by @ceil(log_2(n))@ bits.
 --
@@ -121,9 +130,13 @@ import Clash.XException           (ShowX (..), Undefined (..), errorX, showsPrec
 -- ...
 newtype Index (n :: Nat) =
     -- | The constructor, 'I', and the field, 'unsafeToInteger', are not
-    -- synthesisable.
+    -- synthesizable.
     I { unsafeToInteger :: Integer }
-  deriving Data
+  deriving (Data, Generic)
+
+{-# NOINLINE size# #-}
+size# :: (KnownNat n, 1 <= n) => Index n -> Int
+size# = BV.size# . pack#
 
 instance NFData (Index n) where
   rnf (I i) = rnf i `seq` ()
@@ -178,7 +191,7 @@ gt# (I n) (I m) = n > m
 le# (I n) (I m) = n <= m
 
 -- | The functions: 'enumFrom', 'enumFromThen', 'enumFromTo', and
--- 'enumFromThenTo', are not synthesisable.
+-- 'enumFromThenTo', are not synthesizable.
 instance KnownNat n => Enum (Index n) where
   succ           = (+# fromInteger# 1)
   pred           = (-# fromInteger# 1)
@@ -334,6 +347,31 @@ quot#,rem# :: Index n -> Index n -> Index n
 toInteger# :: Index n -> Integer
 toInteger# (I n) = n
 
+instance (KnownNat n, 1 <= n) => Bits (Index n) where
+  a .&. b           = unpack# $ BV.and# (pack# a) (pack# b)
+  a .|. b           = unpack# $ BV.or# (pack# a) (pack# b)
+  xor a b           = unpack# $ BV.xor# (pack# a) (pack# b)
+  complement        = unpack# . BV.complement# . pack#
+  zeroBits          = unpack# zeroBits
+  bit i             = unpack# $ bit i
+  setBit v i        = unpack# $ replaceBit i high (pack# v)
+  clearBit v i      = unpack# $ replaceBit i low  (pack# v)
+  complementBit v i = unpack# $ complementBit (pack# v) i
+  testBit v i       = testBit (pack# v) i
+  bitSizeMaybe v    = Just (size# v)
+  bitSize           = size#
+  isSigned _        = False
+  shiftL v i        = unpack# $ shiftL (pack# v) i
+  shiftR v i        = unpack# $ shiftR (pack# v) i
+  rotateL v i       = unpack# $ rotateL (pack# v) i
+  rotateR v i       = unpack# $ rotateR (pack# v) i
+  popCount i        = popCount (pack# i)
+
+instance (KnownNat n, 1 <= n) => FiniteBits (Index n) where
+  finiteBitSize        = size#
+  countLeadingZeros  i = countLeadingZeros  (pack# i)
+  countTrailingZeros i = countTrailingZeros (pack# i)
+
 instance Resize Index where
   resize     = resize#
   zeroExtend = extend
@@ -357,9 +395,11 @@ instance Show (Index n) where
 instance ShowX (Index n) where
   showsPrecX = showsPrecXWith showsPrec
 
-instance Undefined (Index n) where deepErrorX = errorX
+instance Undefined (Index n) where
+  deepErrorX = errorX
+  rnfX = rwhnfX
 
--- | None of the 'Read' class' methods are synthesisable.
+-- | None of the 'Read' class' methods are synthesizable.
 instance KnownNat n => Read (Index n) where
   readPrec = fromIntegral <$> (readPrec :: ReadPrec Natural)
 

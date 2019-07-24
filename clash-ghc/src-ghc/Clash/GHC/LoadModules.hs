@@ -20,19 +20,24 @@ module Clash.GHC.LoadModules
   )
 where
 
+#ifndef USE_GHC_PATHS
 #ifndef TOOL_VERSION_ghc
 #error TOOL_VERSION_ghc undefined
+#endif
 #endif
 
 -- External Modules
 import           Clash.Annotations.Primitive     (HDL, PrimitiveGuard)
 import           Clash.Annotations.TopEntity     (TopEntity (..))
+import           Clash.Util                      (ClashException(..), pkgIdFromTypeable)
 import           Control.Arrow                   (first, second)
 import           Control.DeepSeq                 (deepseq)
+import           Control.Exception               (throw)
 #if MIN_VERSION_ghc(8,6,0)
 import           Control.Exception               (throwIO)
 #endif
 import           Control.Monad.IO.Class          (liftIO)
+import           Data.Char                       (isDigit)
 import           Data.Generics.Uniplate.DataOnly (transform)
 import           Data.Data                       (Data)
 import           Data.Typeable                   (Typeable)
@@ -40,11 +45,17 @@ import           Data.List                       (foldl', lookup, nub)
 import           Data.Maybe                      (catMaybes, listToMaybe, mapMaybe)
 import qualified Data.Text                       as Text
 import qualified Data.Time.Clock                 as Clock
+import           Language.Haskell.TH.Syntax      (lift)
+
+#ifdef USE_GHC_PATHS
+import           GHC.Paths                       (libdir)
+#else
 import           System.Exit                     (ExitCode (..))
 import           System.IO                       (hGetLine)
 import           System.IO.Error                 (tryIOError)
 import           System.Process                  (runInteractiveCommand,
                                                   waitForProcess)
+#endif
 
 -- GHC API
 import qualified Annotations
@@ -61,7 +72,7 @@ import qualified HscMain
 import qualified HscTypes
 import qualified MonadUtils
 import qualified Panic
-import qualified GhcPlugins                      (deserializeWithData)
+import qualified GhcPlugins                      (deserializeWithData, installedUnitIdString)
 import qualified TcRnMonad
 import qualified TcRnTypes
 import qualified TidyPgm
@@ -81,11 +92,14 @@ import qualified Var
 -- Internal Modules
 import           Clash.GHC.GHC2Core                           (modNameM, qualifiedNameString')
 import           Clash.GHC.LoadInterfaceFiles                 (loadExternalExprs, primitiveFilePath)
-import           Clash.Util                                   (curLoc)
+import           Clash.Util                                   (curLoc, noSrcSpan, reportTimeDiff)
 import           Clash.Annotations.BitRepresentation.Internal
   (DataRepr', dataReprAnnToDataRepr')
 
 ghcLibDir :: IO FilePath
+#ifdef USE_GHC_PATHS
+ghcLibDir = return libdir
+#else
 ghcLibDir = do
   (libDirM,exitCode) <- getProcessOutput $ "ghc-" ++ TOOL_VERSION_ghc ++ " --print-libdir"
   case exitCode of
@@ -109,6 +123,7 @@ getProcessOutput command =
      output   <- either (const Nothing) Just <$> tryIOError (hGetLine pOut)
      -- return both the output and the exit code.
      return (output, exitCode)
+#endif
 
 loadModules
   :: FilePath
@@ -223,6 +238,7 @@ loadModules tmpDir useColor hdl modName dflagsM idirs = do
 #else
                                  ; simpl_guts <- MonadUtils.liftIO $ HscMain.hscSimplify hsc_env dsMod
 #endif
+                                 ; checkForInvalidPrelude simpl_guts
                                  ; (tidy_guts,_) <- MonadUtils.liftIO $ TidyPgm.tidyProgram hsc_env simpl_guts
                                  ; let pgm        = HscTypes.cg_binds tidy_guts
                                  ; let modFamInstEnv = TcRnTypes.tcg_fam_inst_env $ fst $ GHC.tm_internals_ tcMod
@@ -237,15 +253,18 @@ loadModules tmpDir useColor hdl modName dflagsM idirs = do
         modFamInstEnvs'          = foldl' plusFamInst FamInstEnv.emptyFamInstEnv modFamInstEnvs
 
     modTime <- startTime `deepseq` length binderIds `deepseq` MonadUtils.liftIO Clock.getCurrentTime
-    let modStartDiff = Clock.diffUTCTime modTime startTime
-    MonadUtils.liftIO $ putStrLn $ "GHC: Parsing and optimising modules took: " ++ show modStartDiff
+    let modStartDiff = reportTimeDiff modTime startTime
+    MonadUtils.liftIO $ putStrLn $ "GHC: Parsing and optimising modules took: " ++ modStartDiff
 
     (externalBndrs,clsOps,unlocatable,pFP,reprs) <-
       loadExternalExprs tmpDir hdl (UniqSet.mkUniqSet binderIds) bindersC
 
+    let externalBndrIds = map fst externalBndrs
+    let allBinderIds = externalBndrIds ++ binderIds
+
     extTime <- modTime `deepseq` length unlocatable `deepseq` MonadUtils.liftIO Clock.getCurrentTime
-    let extModDiff = Clock.diffUTCTime extTime modTime
-    MonadUtils.liftIO $ putStrLn $ "GHC: Loading external modules from interface files took: " ++ show extModDiff
+    let extModDiff = reportTimeDiff extTime modTime
+    MonadUtils.liftIO $ putStrLn $ "GHC: Loading external modules from interface files took: " ++ extModDiff
 
     -- Find local primitive annotations
     pFP' <- findPrimitiveAnnotations hdl tmpDir binderIds
@@ -273,7 +292,7 @@ loadModules tmpDir useColor hdl modName dflagsM idirs = do
     topSyn     <- map (second Just) <$> findSynthesizeAnnotations rootIds
     benchAnn   <- findTestBenchAnnotations binderIds
     reprs'     <- findCustomReprAnnotations
-    primGuards <- findPrimitiveGuardAnnotations binderIds
+    primGuards <- findPrimitiveGuardAnnotations allBinderIds
     let varNameString = OccName.occNameString . Name.nameOccName . Var.varName
         topEntities = filter ((== "topEntity") . varNameString) rootIds
         benches     = filter ((== "testBench") . varNameString) rootIds
@@ -305,8 +324,8 @@ loadModules tmpDir useColor hdl modName dflagsM idirs = do
 
     annTime <- extTime `deepseq` length topEntities' `deepseq` pFP1 `deepseq`
                reprs1 `deepseq` primGuards `deepseq` MonadUtils.liftIO Clock.getCurrentTime
-    let annExtDiff = Clock.diffUTCTime annTime extTime
-    MonadUtils.liftIO $ putStrLn $ "GHC: Parsing annotations took: " ++ show annExtDiff
+    let annExtDiff = reportTimeDiff annTime extTime
+    MonadUtils.liftIO $ putStrLn $ "GHC: Parsing annotations took: " ++ annExtDiff
 
     return ( bindersC ++ makeRecursiveGroups externalBndrs
            , clsOps
@@ -561,7 +580,7 @@ wantedOptimizationFlags df =
                ]
 
     -- Coercions between Integer and Clash' numeric primitives cause Clash to
-    -- fail. As strictness only affects simulation behaviour, removing them
+    -- fail. As strictness only affects simulation behavior, removing them
     -- is perfectly safe.
     unwantedLang = [ LangExt.Strict
                    , LangExt.StrictData
@@ -604,9 +623,11 @@ wantedLanguageExtensions df =
              , LangExt.DeriveAnyClass
              , LangExt.DeriveGeneric
              , LangExt.DeriveLift
+             , LangExt.DerivingStrategies
              , LangExt.ExplicitForAll
              , LangExt.ExplicitNamespaces
              , LangExt.FlexibleContexts
+             , LangExt.FlexibleInstances
              , LangExt.KindSignatures
              , LangExt.MagicHash
              , LangExt.MonoLocalBinds
@@ -617,6 +638,9 @@ wantedLanguageExtensions df =
              , LangExt.TypeApplications
              , LangExt.TypeFamilies
              , LangExt.TypeOperators
+#if __GLASGOW_HASKELL__ < 806
+             , LangExt.TypeInType
+#endif
              ]
     unwanted = [ LangExt.ImplicitPrelude
                , LangExt.MonomorphismRestriction
@@ -641,7 +665,7 @@ wantedLanguageExtensions df =
 -- we could lose bits when the original numeric type had more bits than 64.
 --
 -- Removing these strictness annotations is perfectly safe, as they only
--- affect simulation behaviour.
+-- affect simulation behavior.
 removeStrictnessAnnotations ::
      GHC.ParsedModule
   -> GHC.ParsedModule
@@ -702,3 +726,28 @@ removeStrictnessAnnotations pm =
 
     -- rmConDeclF :: GHC.DataId name => GHC.ConDeclField name -> GHC.ConDeclField name
     rmConDeclF cdf = cdf {GHC.cd_fld_type = rmHsType (GHC.cd_fld_type cdf)}
+
+-- | The package id of the clash-prelude we were built with
+preludePkgId :: String
+preludePkgId = $(lift $ pkgIdFromTypeable (undefined :: TopEntity))
+
+-- | Check that we're using the same clash-prelude as we were built with
+--
+-- Because if they differ clash won't be able to recognize any ANNotations.
+checkForInvalidPrelude :: Monad m => HscTypes.ModGuts -> m ()
+checkForInvalidPrelude guts =
+  case filter isWrongPrelude pkgIds of
+    []    -> return ()
+    (x:_) -> throw (ClashException noSrcSpan (msgWrongPrelude x) Nothing)
+  where
+    pkgs = HscTypes.dep_pkgs . HscTypes.mg_deps $ guts
+    pkgIds = map (GhcPlugins.installedUnitIdString . fst) pkgs
+    prelude = "clash-prelude-"
+    isPrelude pkg = case splitAt (length prelude) pkg of
+      (x,y:_) | x == prelude && isDigit y -> True     -- check for a digit so we don't match clash-prelude-extras
+      _ -> False
+    isWrongPrelude pkg = isPrelude pkg && pkg /= preludePkgId
+    msgWrongPrelude pkg = unlines ["Clash only works with the exact clash-prelude it was built with."
+                                  ,"Clash was built with: " ++ preludePkgId
+                                  ,"So can't run with:    " ++ pkg
+                                  ]

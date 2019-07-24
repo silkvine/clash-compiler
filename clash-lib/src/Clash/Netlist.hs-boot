@@ -24,17 +24,21 @@ import Clash.Netlist.Types  (Expr, HWType, Identifier, NetlistMonad, Component,
                              Declaration)
 import SrcLoc               (SrcSpan)
 
+import GHC.Stack (HasCallStack)
 
-genComponent :: Id
+genComponent :: HasCallStack
+             => Id
              -> NetlistMonad ([Bool],SrcSpan,HashMap Identifier Word,Component)
 
-mkExpr :: Bool
+mkExpr :: HasCallStack
+       => Bool
        -> Either Identifier Id
        -> Type
        -> Term
        -> NetlistMonad (Expr,[Declaration])
 
-mkDcApplication :: HWType
+mkDcApplication :: HasCallStack
+                => HWType
                 -> Either Identifier Id
                 -> DataCon
                 -> [Term]
@@ -49,7 +53,7 @@ mkProjection
   -> NetlistMonad (Expr, [Declaration])
 
 mkSelection
-  :: Id
+  :: Either Identifier Id
   -> Term
   -> Type
   -> [Alt]
@@ -57,10 +61,11 @@ mkSelection
 
 mkNetDecl :: LetBinding -> NetlistMonad (Maybe Declaration)
 
-mkDeclarations :: Id -> Term -> NetlistMonad [Declaration]
+mkDeclarations :: HasCallStack => Id -> Term -> NetlistMonad [Declaration]
 
 mkFunApp
-  :: Identifier -- ^ LHS of the let-binder
+  :: HasCallStack
+  => Identifier -- ^ LHS of the let-binder
   -> Id -- ^ Name of the applied function
   -> [Term] -- ^ Function arguments
   -> NetlistMonad [Declaration]

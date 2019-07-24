@@ -52,7 +52,7 @@ import           Clash.Netlist.BlackBox.Types
   (Element(Const, Lit))
 
 hashCompiledPrimitive :: CompiledPrimitive -> Int
-hashCompiledPrimitive (Primitive {name, primType}) = hash (name, primType)
+hashCompiledPrimitive (Primitive {name, primSort}) = hash (name, primSort)
 hashCompiledPrimitive (BlackBoxHaskell {function}) = fst function
 hashCompiledPrimitive (BlackBox {name, kind, outputReg, libraries, imports, includes, template}) =
   hash (name, kind, outputReg, libraries, imports, includes', hashBlackbox template)
@@ -88,17 +88,17 @@ resolvePrimitive'
   => FilePath
   -> UnresolvedPrimitive
   -> IO (TS.Text, GuardedResolvedPrimitive)
-resolvePrimitive' _metaPath (Primitive name primType) =
-  return (name, HasBlackBox (Primitive name primType))
+resolvePrimitive' _metaPath (Primitive name wf primType) =
+  return (name, HasBlackBox (Primitive name wf primType))
 resolvePrimitive' metaPath BlackBox{template=t, includes=i, ..} = do
   let resolvedIncludes = mapM (traverse (traverse (traverse (resolveTemplateSource metaPath)))) i
       resolved         = traverse (traverse (resolveTemplateSource metaPath)) t
-  bb <- BlackBox name kind () outputReg libraries imports <$> resolvedIncludes <*> resolved
+  bb <- BlackBox name workInfo kind () outputReg libraries imports <$> resolvedIncludes <*> resolved
   case warning of
     Just w  -> pure (name, WarnNonSynthesizable (TS.unpack w) bb)
     Nothing -> pure (name, HasBlackBox bb)
-resolvePrimitive' metaPath (BlackBoxHaskell bbName funcName t) =
-  (bbName,) . HasBlackBox . BlackBoxHaskell bbName funcName <$> (mapM (resolveTemplateSource metaPath) t)
+resolvePrimitive' metaPath (BlackBoxHaskell bbName wf funcName t) =
+  (bbName,) . HasBlackBox . BlackBoxHaskell bbName wf funcName <$> (mapM (resolveTemplateSource metaPath) t)
 
 -- | Interprets contents of json file as list of @Primitive@s.
 resolvePrimitive
@@ -186,5 +186,18 @@ constantArgs nm BlackBox {template = BBTemplate template} =
     | nm == "Clash.Sized.Internal.Index.fromInteger#"      = [1]
     | nm == "Clash.Sized.Internal.Signed.fromInteger#"     = [1]
     | nm == "Clash.Sized.Internal.Unsigned.fromInteger#"   = [1]
+    -- There is a special code-path for `index_int` in the Verilog backend in
+    -- case the index is a variable. But this code path only works when the
+    -- vector is (a projection of) a variable. By forcing the arguments of
+    -- index_int we can be sure that arguments are either:
+    --
+    -- Constant Variable
+    -- Variable Constant
+    -- Variable Variable
+    --
+    -- As all other cases would be reduced by the evaluator, and even expensive
+    -- primitives under index_int are fully unrolled.
+    | nm == "Clash.Sized.Vector.index_int"                 = [1,2]
+    | nm == "Clash.Sized.Vector.replace_int"               = [1,2]
     | otherwise = []
 constantArgs _ _ = Set.empty

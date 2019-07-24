@@ -37,6 +37,7 @@ module Clash.Core.Subst
   , extendInScopeIdList
   , extendIdSubst
   , extendIdSubstList
+  , extendGblSubstList
     -- ** Applying substitutions
   , substTm
     -- * Variable renaming
@@ -53,14 +54,15 @@ import           Data.Text.Prettyprint.Doc
 import qualified Data.List                 as List
 
 import           Clash.Core.FreeVars
-  (noFreeVarsOfType, fVsOfTerms, tyFVsOfTypes)
-import           Clash.Core.Pretty         (ppr)
+  (noFreeVarsOfType, localFVsOfTerms, tyFVsOfTypes)
+import           Clash.Core.Pretty         (ppr, fromPpr)
 import           Clash.Core.Term           (LetBinding, Pat (..), Term (..))
 import           Clash.Core.Type           (Type (..))
 import           Clash.Core.VarEnv
-import           Clash.Core.Var            (Id, Var (..), TyVar)
+import           Clash.Core.Var            (Id, Var (..), TyVar, isGlobalId)
 import           Clash.Unique
 import           Clash.Util
+import           Clash.Pretty
 
 -- * Subst
 
@@ -124,11 +126,11 @@ data TvSubst
   = TvSubst InScopeSet -- Variable in scope /after/ substitution
             TvSubstEnv -- Substitution for types
 
-instance Pretty TvSubst where
-  pretty (TvSubst ins tenv) =
+instance ClashPretty TvSubst where
+  clashPretty (TvSubst ins tenv) =
     brackets $ sep [ "TvSubst"
-                   , nest 2 ("In scope:" <+> pretty ins)
-                   , nest 2 ("Type env:" <+> pretty tenv)]
+                   , nest 2 ("In scope:" <+> clashPretty ins)
+                   , nest 2 ("Type env:" <+> clashPretty tenv)]
 
 -- | A substitution  of 'Term's for 'Id's
 --
@@ -201,24 +203,25 @@ data Subst
   { substInScope :: InScopeSet -- Variables in scope /after/ substitution
   , substTmEnv   :: IdSubstEnv -- Substitution for terms
   , substTyEnv   :: TvSubstEnv -- Substitution for types
+  , substGblEnv  :: IdSubstEnv -- Substitution of globals (in terms)
   }
 
 emptySubst
   :: Subst
-emptySubst = Subst emptyInScopeSet emptyVarEnv emptyVarEnv
+emptySubst = Subst emptyInScopeSet emptyVarEnv emptyVarEnv emptyVarEnv
 
 -- | An empty substitution, starting the variables currently in scope
 mkSubst
   :: InScopeSet
   -> Subst
-mkSubst is = Subst is emptyVarEnv emptyVarEnv
+mkSubst is = Subst is emptyVarEnv emptyVarEnv emptyVarEnv
 
 -- | Create a type substitution
 mkTvSubst
   :: InScopeSet
   -> VarEnv Type
   -> Subst
-mkTvSubst is env = Subst is emptyVarEnv env
+mkTvSubst is env = Subst is emptyVarEnv env emptyVarEnv
 
 -- | Generates the in-scope set for the 'Subst' from the types in the incoming
 -- environment.
@@ -234,7 +237,7 @@ zipTvSubst tvs tys
   , neLength tvs tys
   = pprTrace "zipTvSubst" (ppr tvs <> line <> ppr tys) emptySubst
   | otherwise
-  = Subst (mkInScopeSet (tyFVsOfTypes tys)) emptyVarEnv tenv
+  = Subst (mkInScopeSet (tyFVsOfTypes tys)) emptyVarEnv tenv emptyVarEnv
  where
   tenv = zipTyEnv tvs tys
 
@@ -250,14 +253,24 @@ extendIdSubst
   -> Id
   -> Term
   -> Subst
-extendIdSubst (Subst is env tenv) i e = Subst is (extendVarEnv i e env) tenv
+extendIdSubst (Subst is env tenv genv) i e =
+  Subst is (extendVarEnv i e env) tenv genv
 
 -- | Extend the substitution environment with a list of 'Id' substitutions
 extendIdSubstList
   :: Subst
   -> [(Id,Term)]
   -> Subst
-extendIdSubstList (Subst is env tenv) es = Subst is (extendVarEnvList env es) tenv
+extendIdSubstList (Subst is env tenv genv) es =
+  Subst is (extendVarEnvList env es) tenv genv
+
+-- | Extend the substitution environment with a list of global 'Id' substitutions
+extendGblSubstList
+  :: Subst
+  -> [(Id,Term)]
+  -> Subst
+extendGblSubstList (Subst is env tenv genv) es =
+  Subst is env tenv (extendVarEnvList genv es)
 
 -- | Extend the substitution environment with a new 'TyVar' substitution
 extendTvSubst
@@ -265,14 +278,16 @@ extendTvSubst
   -> TyVar
   -> Type
   -> Subst
-extendTvSubst (Subst is env tenv) tv t = Subst is env (extendVarEnv tv t tenv)
+extendTvSubst (Subst is env tenv genv) tv t =
+  Subst is env (extendVarEnv tv t tenv) genv
 
 -- | Extend the substitution environment with a list of 'TyVar' substitutions
 extendTvSubstList
   :: Subst
   -> [(TyVar, Type)]
   -> Subst
-extendTvSubstList (Subst is env tenv) ts = Subst is env (extendVarEnvList tenv ts)
+extendTvSubstList (Subst is env tenv genv) ts =
+  Subst is env (extendVarEnvList tenv ts) genv
 
 -- | Add an 'Id' to the in-scope set: as a side effect, remove any existing
 -- substitutions for it.
@@ -280,8 +295,8 @@ extendInScopeId
   :: Subst
   -> Id
   -> Subst
-extendInScopeId (Subst inScope env tenv) id' =
-  Subst inScope' env' tenv
+extendInScopeId (Subst inScope env tenv genv) id' =
+  Subst inScope' env' tenv genv
  where
   inScope' = extendInScopeSet inScope id'
   env'     = delVarEnv env id'
@@ -291,8 +306,8 @@ extendInScopeIdList
   :: Subst
   -> [Id]
   -> Subst
-extendInScopeIdList (Subst inScope env tenv) ids =
-  Subst inScope' env' tenv
+extendInScopeIdList (Subst inScope env tenv genv) ids =
+  Subst inScope' env' tenv genv
  where
   inScope' = extendInScopeSetList inScope ids
   env'     = delVarEnvList env ids
@@ -306,7 +321,7 @@ substTy
   => Subst
   -> Type
   -> Type
-substTy (Subst inScope _ tvS) ty
+substTy (Subst inScope _ tvS _) ty
   | nullVarEnv tvS
   = ty
   | otherwise
@@ -347,15 +362,15 @@ checkValidSubst
   -> a
 checkValidSubst subst@(TvSubst inScope tenv) tys a =
   WARN( not (isValidSubst subst),
-        "inScope" <+> pretty inScope <> line <>
-        "tenv" <+> pretty tenv <> line <>
-        "tenvFVs" <+> pretty (tyFVsOfTypes tenv) <> line <>
-        "tys" <+> ppr tys)
+        "inScope" <+> clashPretty inScope <> line <>
+        "tenv" <+> clashPretty tenv <> line <>
+        "tenvFVs" <+> clashPretty (tyFVsOfTypes tenv) <> line <>
+        "tys" <+> fromPpr tys)
   WARN( not tysFVsInSope,
-       "inScope" <+> pretty inScope <> line <>
-       "tenv" <+> pretty tenv <> line <>
-       "tys" <+> ppr tys <> line <>
-       "needsInScope" <+> pretty needsInScope)
+       "inScope" <+> clashPretty inScope <> line <>
+       "tenv" <+> clashPretty tenv <> line <>
+       "tys" <+> fromPpr tys <> line <>
+       "needsInScope" <+> clashPretty needsInScope)
   a
  where
   needsInScope = foldrWithUnique (\k _ s -> delVarSetByKey k s)
@@ -409,7 +424,9 @@ substTyVarBndr
   -> TyVar
   -> (TvSubst, TyVar)
 substTyVarBndr subst@(TvSubst inScope tenv) oldVar =
-  ASSERT2( no_capture, ppr oldVar <> line <> ppr newVar <> line <> pretty subst)
+  ASSERT2( no_capture, clashPretty oldVar <> line
+                    <> clashPretty newVar <> line
+                    <> clashPretty subst )
   (TvSubst (inScope `extendInScopeSet` newVar) newEnv, newVar)
  where
   newEnv | noChange  = delVarEnv tenv oldVar
@@ -470,15 +487,18 @@ substTm doc subst = go where
 -- | Find the substitution for an 'Id' in the 'Subst'
 lookupIdSubst
   :: HasCallStack
-  => Doc ann
+  => Doc ()
   -> Subst
   -> Id
   -> Term
-lookupIdSubst doc (Subst inScope tmS _) v
+lookupIdSubst doc (Subst inScope tmS _ genv) v
+  | isGlobalId v = case lookupVarEnv v genv of
+                     Just e -> e
+                     _      -> Var v
   | Just e <- lookupVarEnv v tmS = e
   -- Vital! See 'IdSubstEnv' Note [Extending the Subst]
   | Just v' <- lookupInScope inScope v = Var (coerce v')
-  | otherwise = WARN(True, "Subst.lookupIdSubst" <+> doc <+> ppr v)
+  | otherwise = WARN(True, "Subst.lookupIdSubst" <+> doc <+> fromPpr v)
                 Var v
 
 -- | Substitute an 'Id' for another one according to the 'Subst' given,
@@ -489,8 +509,8 @@ substIdBndr
   => Subst
   -> Id
   -> (Subst,Id)
-substIdBndr subst@(Subst inScope env tenv) oldId =
-  (Subst (inScope `extendInScopeSet` newId) newEnv tenv, newId)
+substIdBndr subst@(Subst inScope env tenv genv) oldId =
+  (Subst (inScope `extendInScopeSet` newId) newEnv tenv genv, newId)
  where
   id1 = uniqAway inScope oldId
   newId | noTypeChange = id1
@@ -520,9 +540,9 @@ substTyVarBndr'
   => Subst
   -> TyVar
   -> (Subst,TyVar)
-substTyVarBndr' (Subst inScope tmS tyS) tv =
+substTyVarBndr' (Subst inScope tmS tyS tgS) tv =
   case substTyVarBndr (TvSubst inScope tyS) tv of
-    (TvSubst inScope' tyS',tv') -> (Subst inScope' tmS tyS', tv')
+    (TvSubst inScope' tyS',tv') -> (Subst inScope' tmS tyS' tgS, tv')
 
 -- | Apply a substitution to an entire set of let-bindings, additionally
 -- returning an updated 'Subst' that should be used by subsequent substitutions.
@@ -665,7 +685,7 @@ aeqTerm
   -> Bool
 aeqTerm t1 t2 = aeqTerm' inScope t1 t2
  where
-  inScope = mkInScopeSet (fVsOfTerms [t1,t2])
+  inScope = mkInScopeSet (localFVsOfTerms [t1,t2])
 
 -- | Alpha equality for terms. Faster than 'aeqTerm' as it doesn't need to
 -- calculate the free variables to create the 'InScopeSet'
@@ -684,7 +704,7 @@ acmpTerm
   -> Ordering
 acmpTerm t1 t2 = acmpTerm' inScope t1 t2
  where
-  inScope = mkInScopeSet (fVsOfTerms [t1,t2])
+  inScope = mkInScopeSet (localFVsOfTerms [t1,t2])
 
 -- | Alpha comparison for types. Faster than 'acmpTerm' as it doesn't need to
 -- calculate the free variables to create the 'InScopeSet'

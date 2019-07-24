@@ -1,12 +1,14 @@
 {-|
 Copyright  :  (C) 2013-2016, University of Twente,
-                  2016     , Myrtle Software Ltd
+                  2019     , Gergő Érdi
+                  2016-2019, Myrtle Software Ltd
 License    :  BSD2 (see the file LICENSE)
 Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 -}
 
 {-# LANGUAGE DataKinds                  #-}
 {-# LANGUAGE DeriveDataTypeable         #-}
+{-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DeriveAnyClass             #-}
 {-# LANGUAGE KindSignatures             #-}
 {-# LANGUAGE MagicHash                  #-}
@@ -17,6 +19,7 @@ Maintainer :  Christiaan Baaij <christiaan.baaij@gmail.com>
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE TypeOperators              #-}
 {-# LANGUAGE UndecidableInstances       #-}
+{-# LANGUAGE ViewPatterns               #-}
 
 {-# LANGUAGE Unsafe #-}
 
@@ -81,7 +84,7 @@ module Clash.Sized.Internal.BitVector
   , ge#
   , gt#
   , le#
-    -- *** Enum (not synthesisable)
+    -- *** Enum (not synthesizable)
   , enumFrom#
   , enumFromThen#
   , enumFromTo#
@@ -123,6 +126,7 @@ module Clash.Sized.Internal.BitVector
   -- ** Other
   , undefError
   , checkUnpackUndef
+  , bitPattern
   )
 where
 
@@ -133,12 +137,14 @@ import Data.Data                  (Data)
 import Data.Default.Class         (Default (..))
 import Data.Proxy                 (Proxy (..))
 import Data.Typeable              (Typeable, typeOf)
+import GHC.Generics               (Generic)
+import Data.Maybe                 (fromMaybe)
 import GHC.Integer                (smallInteger)
 import GHC.Prim                   (dataToTag#)
 import GHC.Stack                  (HasCallStack, withFrozenCallStack)
 import GHC.TypeLits               (KnownNat, Nat, type (+), type (-), natVal)
 import GHC.TypeLits.Extra         (Max)
-import Language.Haskell.TH        (Q, TExp, TypeQ, appT, conT, litT, numTyLit, sigE)
+import Language.Haskell.TH        (Q, TExp, TypeQ, appT, conT, litT, numTyLit, sigE, Lit(..), litE, Pat, litP)
 import Language.Haskell.TH.Syntax (Lift(..))
 import Test.QuickCheck.Arbitrary  (Arbitrary (..), CoArbitrary (..),
                                    arbitraryBoundedIntegral,
@@ -150,7 +156,7 @@ import Clash.Class.Resize         (Resize (..))
 import Clash.Promoted.Nat
   (SNat (..), SNatLE (..), compareSNat, snatToInteger, snatToNum)
 import Clash.XException
-  (ShowX (..), Undefined (..), errorX, showsPrecXWith)
+  (ShowX (..), Undefined (..), errorX, showsPrecXWith, rwhnfX)
 
 import {-# SOURCE #-} qualified Clash.Sized.Vector         as V
 import {-# SOURCE #-} qualified Clash.Sized.Internal.Index as I
@@ -169,22 +175,22 @@ import                qualified Data.List                  as L
 -- * 'Num' instance performs /unsigned/ arithmetic.
 data BitVector (n :: Nat) =
     -- | The constructor, 'BV', and  the field, 'unsafeToInteger', are not
-    -- synthesisable.
-    BV { unsafeMask      :: Integer
-       , unsafeToInteger :: Integer
+    -- synthesizable.
+    BV { unsafeMask      :: !Integer
+       , unsafeToInteger :: !Integer
        }
-  deriving Data
+  deriving (Data, Generic)
 
 -- * Bit
 
 -- | Bit
 data Bit =
   -- | The constructor, 'Bit', and  the field, 'unsafeToInteger#', are not
-  -- synthesisable.
-  Bit { unsafeMask#      :: Integer
-      , unsafeToInteger# :: Integer
+  -- synthesizable.
+  Bit { unsafeMask#      :: !Integer
+      , unsafeToInteger# :: !Integer
       }
-  deriving Data
+  deriving (Data, Generic)
 
 -- * Constructions
 -- ** Initialisation
@@ -213,7 +219,9 @@ instance Show Bit where
 instance ShowX Bit where
   showsPrecX = showsPrecXWith showsPrec
 
-instance Undefined Bit where deepErrorX = errorX
+instance Undefined Bit where
+  deepErrorX = errorX
+  rnfX = rwhnfX
 
 instance Lift Bit where
   lift (Bit m i) = [| fromInteger## m i |]
@@ -357,7 +365,9 @@ instance KnownNat n => Show (BitVector n) where
 instance KnownNat n => ShowX (BitVector n) where
   showsPrecX = showsPrecXWith showsPrec
 
-instance Undefined (BitVector n) where deepErrorX = errorX
+instance Undefined (BitVector n) where
+  deepErrorX = errorX
+  rnfX = rwhnfX
 
 -- | Create a binary literal
 --
@@ -440,7 +450,7 @@ le# (BV 0 n) (BV 0 m) = n <= m
 le#  bv1 bv2 = undefErrorI "<=" bv1 bv2
 
 -- | The functions: 'enumFrom', 'enumFromThen', 'enumFromTo', and
--- 'enumFromThenTo', are not synthesisable.
+-- 'enumFromThenTo', are not synthesizable.
 instance KnownNat n => Enum (BitVector n) where
   succ           = (+# fromInteger# 0 1)
   pred           = (-# fromInteger# 0 1)
@@ -725,8 +735,12 @@ replaceBit# bv@(BV m v) i (Bit mb b)
                           ]
 
 {-# NOINLINE setSlice# #-}
-setSlice# :: BitVector (m + 1 + i) -> SNat m -> SNat n -> BitVector (m + 1 - n)
-          -> BitVector (m + 1 + i)
+setSlice#
+  :: BitVector (m + 1 + i)
+  -> SNat m
+  -> SNat n
+  -> BitVector (m + 1 - n)
+  -> BitVector (m + 1 + i)
 setSlice# (BV iMask i) m n (BV jMask j) = BV ((iMask .&. mask) .|. jMask')
                                              ((i     .&. mask) .|. j')
   where
@@ -738,8 +752,11 @@ setSlice# (BV iMask i) m n (BV jMask j) = BV ((iMask .&. mask) .|. jMask')
     mask = complement ((2 ^ (m' + 1) - 1) `xor` (2 ^ n' - 1))
 
 {-# NOINLINE split# #-}
-split# :: forall n m . KnownNat n
-       => BitVector (m + n) -> (BitVector m, BitVector n)
+split#
+  :: forall n m
+   . KnownNat n
+  => BitVector (m + n)
+  -> (BitVector m, BitVector n)
 split# (BV m i) = (BV lMask l, BV rMask r)
   where
     n     = fromInteger (natVal (Proxy @n))
@@ -967,7 +984,7 @@ undefined# =
 -- >>> expected `isLike` checked
 -- False
 --
--- __NB__: Not synthesisable
+-- __NB__: Not synthesizable
 isLike :: BitVector n -> BitVector n -> Bool
 isLike (BV cMask c) (BV eMask e) = e' == c' && e' == c''
   where
@@ -979,3 +996,39 @@ isLike (BV cMask c) (BV eMask e) = e' == c' && e' == c''
     -- | checked with undefined bits set to 1
     c'' = (c .|. cMask) .&. complement eMask
 {-# NOINLINE isLike #-}
+
+fromBits :: [Bit] -> Integer
+fromBits = L.foldl (\v b -> v `shiftL` 1 .|. fromIntegral b) 0
+
+-- | Template Haskell macro for generating a pattern matching on some
+-- bits of a value.
+--
+-- This macro compiles to an efficient view pattern that matches the
+-- bits of a given value against the bits specified in the
+-- pattern. The scrutinee can be any type that is an instance of the
+-- 'Num', 'Bits' and 'Eq' typeclasses.
+--
+-- The bit pattern is specified by a string which contains @\'0\'@ or
+-- @\'1\'@ for matching a bit, or @\'.\'@ for bits which are not matched.
+--
+-- The following example matches a byte against two bit patterns where
+-- some bits are relevant and others are not:
+--
+-- @
+--   decode :: Unsigned 8 -> Maybe Bool
+--   decode $(bitPattern "00...110") = Just True
+--   decode $(bitPattern "10..0001") = Just False
+--   decode _ = Nothing
+-- @
+bitPattern :: String -> Q Pat
+bitPattern s = [p| (($mask .&.) -> $target) |]
+  where
+    bs = parse <$> s
+
+    mask = litE . IntegerL . fromBits $ maybe 0 (const 1) <$> bs
+    target = litP . IntegerL . fromBits $ fromMaybe 0 <$> bs
+
+    parse '.' = Nothing
+    parse '0' = Just 0
+    parse '1' = Just 1
+    parse c = error $ "Invalid bit pattern: " ++ show c

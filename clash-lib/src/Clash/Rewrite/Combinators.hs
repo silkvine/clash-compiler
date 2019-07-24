@@ -29,28 +29,12 @@ import           Control.DeepSeq             (deepseq)
 import           Control.Monad               ((>=>))
 import qualified Control.Monad.Writer        as Writer
 import qualified Data.Monoid                 as Monoid
-import           Data.Text                   (Text)
-import           Data.Either                 (lefts, rights)
 
-import           Clash.Core.Term             (Term (..))
-import           Clash.Core.Util             (patIds, collectArgs)
+import           Clash.Core.Term             (Term (..), CoreContext (..), primArg)
+import           Clash.Core.Util             (patIds)
 import           Clash.Core.VarEnv
   (extendInScopeSet, extendInScopeSetList)
 import           Clash.Rewrite.Types
-
--- | Given a function application, find the primitive it's applied. Yields
--- Nothing if given term is not an application or if it is not a primitive.
-primArg
-  :: Term
-  -- ^ Function application
-  -> Maybe (Text, Int, Int)
-  -- ^ If @Term@ was a primitive: (name of primitive, #type args, #term args)
-primArg (collectArgs -> t) =
-  case t of
-    (Prim nm _, args) ->
-      Just (nm, length (rights args), length (lefts args))
-    _ ->
-      Nothing
 
 -- | Apply a transformation on the subtrees of an term
 allR
@@ -93,21 +77,23 @@ allR trans (TransformContext is c) (Case scrut ty alts) =
   rewriteAlt (p,e) =
     let (tvs,ids) = patIds p
         is'       = extendInScopeSetList (extendInScopeSetList is tvs) ids
-    in  (p,) <$> trans (TransformContext is' (CaseAlt tvs ids:c)) e
+    in  (p,) <$> trans (TransformContext is' (CaseAlt p : c)) e
 
 allR _ _ tm = pure tm
 
 infixr 6 >->
 -- | Apply two transformations in succession
 (>->) :: Monad m => Transform m -> Transform m -> Transform m
-(>->) r1 r2 c = r1 c >=> r2 c
+(>->) = \r1 r2 c -> r1 c >=> r2 c
+{-# INLINE (>->) #-}
 
 infixr 6 >-!->
 -- | Apply two transformations in succession, and perform a deepseq in between.
 (>-!->) :: Monad m => Transform m -> Transform m -> Transform m
-(>-!->) r1 r2 c e = do
+(>-!->) = \r1 r2 c e -> do
   e' <- r1 c e
   deepseq e' (r2 c e')
+{-# INLINE (>-!->) #-}
 
 {-
 Note [topdown repeatR]
@@ -144,24 +130,27 @@ bottomupR r = allR (bottomupR r) >-> r
 infixr 5 !->
 -- | Only apply the second transformation if the first one succeeds.
 (!->) :: Rewrite m -> Rewrite m -> Rewrite m
-(!->) r1 r2 c expr = do
+(!->) = \r1 r2 c expr -> do
   (expr',changed) <- Writer.listen $ r1 c expr
   if Monoid.getAny changed
     then r2 c expr'
     else return expr'
+{-# INLINE (!->) #-}
 
 infixr 5 >-!
 -- | Only apply the second transformation if the first one fails.
 (>-!) :: Rewrite m -> Rewrite m -> Rewrite m
-(>-!) r1 r2 c expr = do
+(>-!) = \r1 r2 c expr -> do
   (expr',changed) <- Writer.listen $ r1 c expr
   if Monoid.getAny changed
     then return expr'
     else r2 c expr'
+{-# INLINE (>-!) #-}
 
 -- | Keep applying a transformation until it fails.
 repeatR :: Rewrite m -> Rewrite m
-repeatR r = r !-> repeatR r
+repeatR = let go r = r !-> repeatR r in go
+{-# INLINE repeatR #-}
 
 whenR :: Monad m
       => (TransformContext -> Term -> m Bool)

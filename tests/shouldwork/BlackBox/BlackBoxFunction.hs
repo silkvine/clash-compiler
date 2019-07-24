@@ -14,7 +14,7 @@ import Clash.Netlist.BlackBox.Types
 import Clash.Annotations.Primitive (Primitive(..), HDL(..))
 
 myMultiplyTF :: BlackBoxFunction
-myMultiplyTF isD resId primName args ty =
+myMultiplyTF isD resId primName args ty = pure $
   Right ( emptyBlackBoxMeta
         , BBTemplate [Text "123456 * ", ArgGen 0 0, Text " * ", ArgGen 0 1]
         )
@@ -29,7 +29,7 @@ myMultiply a b =
 {-# NOINLINE myMultiply #-}
 
 topEntity
-  :: HiddenClockReset System Source Asynchronous
+  :: SystemClockResetEnable
   => Signal System Int
   -> Signal System Int
 topEntity a = myMultiply a a
